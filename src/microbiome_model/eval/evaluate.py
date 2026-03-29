@@ -1,56 +1,41 @@
+import sys
+from pathlib import Path
+
+# Ensure project root is on PYTHONPATH (so `import microbiome_model...` works)
+ROOT = Path(__file__).resolve().parents[3]  # .../microbiome_model (project root)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import os
+import re
+import json
+import shutil
+from glob import glob
+from datetime import datetime
+from collections import defaultdict
+import logging
+
+import numpy as np
+import pandas as pd
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pandas as pd
-import numpy as np
-from collections import defaultdict
-import logging
+
 from tqdm import tqdm
-from models import SampleLevelRegressor, BasicRegressorWithASVEncoder
-from datetime import datetime
-from sklearn.metrics import mean_absolute_error
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-#from dataset import load_data, sample_test_data
-import os 
-from glob import glob
-import re 
-import seaborn as sns
 import matplotlib.pyplot as plt
-from model_orig import BasicRegressor, BasicRegressorwithUnifrac
-import json
-import shutil
-from dataset_sparse import collate_fn as sparse_collate_fn
-from torch.utils.data import Dataset, DataLoader
-from dataset import DataProcessor, Arguments
-def _mean_absolute_error(pred_val, true_val, fname, labels=None):
-    pred_val = np.squeeze(pred_val)
-    true_val = np.squeeze(true_val)
-    mae = np.mean(np.abs(true_val - pred_val))
 
-    min_x = np.min(true_val)
-    max_x = np.max(true_val)
-    coeff = np.polyfit(true_val, pred_val, deg=1)
-    p = np.poly1d(coeff)
-    xx = np.linspace(min_x, max_x, 50)
-    yy = p(xx)
+import seaborn as sns
 
-    diag = np.polyfit(true_val, true_val, deg=1)
-    p = np.poly1d(diag)
-    diag_xx = np.linspace(min_x, max_x, 50)
-    diag_yy = p(diag_xx)
-    data = {"pred": pred_val, "true": true_val}
-    data = pd.DataFrame(data=data)
-    plot = sns.scatterplot(data, x="true", y="pred")
-    plt.plot(xx, yy)
-    plt.plot(diag_xx, diag_yy)
-    mae = "%.4g" % mae
-    plot.set(xlabel="True")
-    plot.set(ylabel="Predicted")
-    plot.set(title=f"MAE: {mae}")
-    plt.savefig(fname)
-    plt.close()
-    return mae
+# ---- project imports ----
+from microbiome_model.models import build_model
+from microbiome_model.models.zoo import SampleLevelRegressor, GeneralizedRegressor
+from microbiome_model.models.orig import BasicRegressor, BasicRegressorwithUnifrac, BasicRegressorNew
+from microbiome_model.data.dataset_sparse import collate_fn as sparse_collate_fn
+from microbiome_model.data.dataset import DataProcessor, Arguments
+from microbiome_model.utils.misc import _mean_absolute_error
+from microbiome_model.training.pre_training_masked import MaskedAbundancePretraining
+
 
 
 def predict(model, loader, device, multitask=False):
@@ -65,17 +50,18 @@ def predict(model, loader, device, multitask=False):
     with torch.no_grad():
         for batch in loader:
             embeddings = batch['embeddings'].to(device, dtype=torch.float32)
-            abundances = batch['abundances'].to(device)
+            abundances = batch['abundances'].to(device) / 1e4
             masks = batch['masks'].to(device)
             targets = batch['outdoor_add_0'].to(device)
             all_ids.extend(batch["SampleID"])
             env = batch['env'].to(device, dtype=torch.float32)  # 0 for indoor, 1 for outdoor
             features = batch['season'].to(device)  # seasonal features
+            #abundances = batch["binned_abundances"].to(device)  # Use binned abundances for prediction
             # print("Num non-zero ASVs per sample:", (abundances > 0).sum(-1).float().mean())
             # print("Top-1 abundance value:", abundances.max(-1).values.mean())
 
-
-            outputs, _ , _ = model(embeddings, abundances, masks, features, env=env)
+            outputss = model(embeddings, abundances, masks, features, env=env)
+            outputs = outputss[0]
             if multitask:
                 p_indoor = outputs[0]
                 p_outdoor = outputs[1]
@@ -217,7 +203,7 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path):
     results_valid = {}
     all_labels = []
     all_predictions = []
-    eval_runs = 7
+    eval_runs = 5
     runs = 3
     multitask = False
     mean_mae = 0
@@ -229,6 +215,7 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path):
         # ---- Find best run (lowest val MAE) ----
         best_mae = float("inf")
         best_run_dir = None
+        best_run_id = None
 
         for i in range(1, runs+1):
             dir = f"{res}/{donor_id}/run_{i}/"
@@ -238,6 +225,7 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path):
                 if mae < best_mae:
                     best_mae = mae
                     best_run_dir = dir
+                    best_run_id = i
 
         print(f"Best run for donor {donor_id}: {best_run_dir} (val MAE {best_mae})")
 
@@ -251,24 +239,43 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path):
             embedding_file=embedding_path,
             embedding="DNABERT",
             heldout=donor_id,
+            sort_asvs=True
                 )
             data_processor = DataProcessor(args)
             data_processor.load_data(multitask=True, column="bi_month_name")
             
             test_dataset = data_processor.sample_test_data()
-            test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=4, collate_fn=sparse_collate_fn)
+            test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=4, collate_fn=sparse_collate_fn)
             
 
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            cfg_path = os.path.join(best_run_dir, f"model_config.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    model_cfg = json.load(f)
+                    if "model_name" not in model_cfg:
+                        model_cfg["model_name"] = "BasicRegressor"
+            else:
+                logging.warning(
+                    "model_config.json not found in %s; falling back to default BasicRegressor config.",
+                    best_run_dir,
+                )
+                model_cfg = {"model_name": "BasicRegressor", "input_dim": 128, "pe": False}
+            model_a = build_model(model_cfg, str(device))
+            checkpoint = torch.load(os.path.join(best_run_dir, "model.pt"), map_location=device)
+            model_a.load_state_dict(checkpoint, strict=True)
 
-            model = BasicRegressor(input_dim=128, pe=False)
-            model.load_state_dict(torch.load(best_run_dir + "model.pt"))
-            model.to(device)
 
-            labels, predictions = predict(model, test_loader, device, multitask=multitask)
+            model_a.to(device)
+
+            labels, predictions = predict(model_a, test_loader, device, multitask=multitask)
 
             mae_t = _mean_absolute_error(predictions*100, labels*100, f'{best_run_dir}/test.png')
             total_mae += float(mae_t)
+            # for j in range(len(predictions)):
+
+            #     print(f"Donor {donor_id} | Sample {j} | True: {labels[j][0]:.2f} | Pred: {predictions[j][0]:.2f}")
+            print(f"Donor {donor_id} | MAE: {mae_t}")
 
             donor_labels.extend(labels*100)
             donor_preds.extend(predictions*100)
@@ -310,12 +317,16 @@ if __name__ == "__main__":
 #  'D25','D30','D5','D21','D18','D14','D12','D24','D9','D16']
         #donor_ids = ["D27", "D15","D12", "D24"]#, "D15",'D19', "D22", "D27", ]  #
 
-        output_dir = "../results/multitask_all_nope_bimonth_env_features/"
-        #biom_file = "../../process_data_all/exported-feature-table/feature-table.biom"
-        biom_file = "../../data/new_data/feature-table/feature-table.biom"
-        sheds_file = "../../data/new_data/metadata_sheds.tsv"
-        metadata_file = "../../data/new_data/combined_metadata_merged.tsv"
-        embedding_path = "../../data/embeddings/all_data.h5"
+        data_dir = "/s/chromatin/o/nobackup/Saira/Microbiome_Project/"
+        output_dir = os.path.join(data_dir, "microbiome_model/results/ModelSelection/tmp")
+        output_dir = os.path.join(data_dir, "microbiome_model/results/all_data_abundance_proj_notanh_grl/") #clusteredbaseline2
+        biom_file = os.path.join(data_dir, "process_data_all/exported-feature-table/feature-table.biom")
+        biom_file_sheds = os.path.join(data_dir, "data/new_data/feature-table/feature-table.biom")
+        sheds_file = os.path.join(data_dir, "data/new_data/metadata_sheds.tsv")
+        metadata_file = os.path.join(data_dir, "data/new_data/combined_metadata_merged.tsv")
+        embedding_path = os.path.join(data_dir, "data/embeddings/all_data.h5")
         donor_ids = pd.read_csv(sheds_file, sep="\t")['DonorID'].unique().tolist()
+        #donor_ids = ["D4", "D5", "D6", "D7", "D8", "D9", "D10"] #, "D11", "D12", "D13"] #, "D14", "D15", "D16", "D17", "D18", "D19", "D20", "D21", "D22"]
+        donor_ids =  ["D15"] #, "D7"]#["D25"] #, "D6"]
         evaluate_basic(donor_ids, output_dir, metadata_file, biom_file, embedding_path)
-        evaluate_all_runs(donor_ids, output_dir, metadata_file, biom_file, embedding_path)
+        #evaluate_all_runs(donor_ids, output_dir, metadata_file, biom_file, embedding_path)

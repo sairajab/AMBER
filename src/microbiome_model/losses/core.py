@@ -5,8 +5,9 @@ import torch.nn.functional as F
 def compute_count_loss(relative_counts, count_pred, loss_type='mse'):
         
         #print(torch.abs(relative_counts - count_pred).max(), torch.abs(relative_counts - count_pred).min(), torch.abs(relative_counts - count_pred).median())
-
         if loss_type == 'mse':
+            if relative_counts.shape != count_pred.shape:
+                relative_counts = relative_counts.unsqueeze(-1)  # [B, L] -> [B, L, 1]
             loss = torch.square(relative_counts - count_pred)
         else:
             loss = F.smooth_l1_loss(count_pred, relative_counts, beta=0.2, reduction='none')  # Huber loss

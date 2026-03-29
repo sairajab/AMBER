@@ -2,7 +2,133 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
 
+# def create_augmented_batch_old(embeddings, abundances, masks, augmentation_prob=0.3):
+#     """
+#     Data augmentation for better generalization.
+    
+#     Strategies:
+#     1. Dropout random microbes
+#     2. Add Gaussian noise to abundances
+#     3. Permute microbe order (set-invariant)
+#     """
+#     batch_size, seq_len, _ = embeddings.shape
+    
+#     if torch.rand(1).item() < augmentation_prob:
+#         # Randomly drop some microbes
+#         dropout_mask = torch.bernoulli(torch.ones_like(masks) * 0.8)  # Keep 80%
+#         masks = masks * dropout_mask
+        
+#         # Add small noise to abundances
+#         noise = torch.randn_like(abundances) * 0.01
+#         abundances = abundances + noise
+#         abundances = abundances.clamp(min=0)
+    
+#     return embeddings, abundances, masks
+
+
+def create_augmented_batch_DDD(embeddings, abundances, masks, augmentation_prob=0.3):
+    batch_size, seq_len, _ = embeddings.shape
+    
+    # Clone everything upfront — never touch originals
+    aug_embeddings = embeddings.clone()
+    aug_abundances = abundances.clone()
+    aug_masks = masks.clone()
+
+    # 1. ASV dropout
+    dropout_mask = torch.bernoulli(torch.ones_like(aug_masks) * 0.85)
+    aug_masks = aug_masks * dropout_mask
+
+    # 2. CLR-safe abundance noise
+    noise = torch.randn_like(aug_abundances) * 0.05
+    aug_abundances = aug_abundances + noise
+
+    # 3. Rank perturbation — swap pairs
+    if torch.rand(1).item() < 0.3:
+        perm = torch.randperm(seq_len, device=embeddings.device)[:max(2, seq_len // 10)]
+        for i in range(0, len(perm) - 1, 2):
+            idx1, idx2 = perm[i], perm[i + 1]
+            # Use temporary variables instead of in-place swap
+            tmp_abund = aug_abundances[:, idx1].clone()
+            aug_abundances[:, idx1] = aug_abundances[:, idx2]
+            aug_abundances[:, idx2] = tmp_abund
+
+            tmp_emb = aug_embeddings[:, idx1].clone()
+            aug_embeddings[:, idx1] = aug_embeddings[:, idx2]
+            aug_embeddings[:, idx2] = tmp_emb
+
+            tmp_mask = aug_masks[:, idx1].clone()
+            aug_masks[:, idx1] = aug_masks[:, idx2]
+            aug_masks[:, idx2] = tmp_mask
+
+    # 4. Mixup (abundance-only)
+    if torch.rand(1).item() < 0.3 and batch_size > 1:
+        lam = torch.distributions.Beta(0.4, 0.4).sample()
+        mix_idx = torch.randperm(batch_size, device=embeddings.device)
+        aug_abundances = lam * aug_abundances + (1 - lam) * aug_abundances[mix_idx]
+        aug_masks = aug_masks * aug_masks[mix_idx]
+        return aug_embeddings, aug_abundances, aug_masks, lam, mix_idx
+
+    return aug_embeddings, aug_abundances, aug_masks, None, None
+
+def compute_diversity_indices(abundances, masks):
+    """
+    Compute Shannon and Simpson diversity indices.
+    
+    Args:
+        abundances: [B, L] relative abundances
+        masks: [B, L] valid positions
+    
+    Returns:
+        [B, 2] Shannon and Simpson indices
+    """
+    # Ensure abundances sum to 1 per sample
+    masks = masks.unsqueeze(-1)  # [B, L, 1]
+    masked_abundances = abundances * masks  # Apply mask to abundances
+    abundance_sums = masked_abundances.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    normalized = masked_abundances / abundance_sums
+    
+    # Shannon index: -sum(p_i * log(p_i))
+    log_p = torch.log(normalized.clamp(min=1e-10))
+    shannon = -(normalized * log_p * masks).sum(dim=1)
+    
+    # Simpson index: 1 - sum(p_i^2)
+    simpson = 1 - (normalized ** 2 * masks).sum(dim=1)
+    
+    return torch.stack([shannon, simpson], dim=1)
+
+def _mean_absolute_error(pred_val, true_val, fname, labels=None):
+    pred_val = np.squeeze(pred_val)
+    true_val = np.squeeze(true_val)
+    mae = np.mean(np.abs(true_val - pred_val))
+
+    min_x = np.min(true_val)
+    max_x = np.max(true_val)
+    coeff = np.polyfit(true_val, pred_val, deg=1)
+    p = np.poly1d(coeff)
+    xx = np.linspace(min_x, max_x, 50)
+    yy = p(xx)
+
+    diag = np.polyfit(true_val, true_val, deg=1)
+    p = np.poly1d(diag)
+    diag_xx = np.linspace(min_x, max_x, 50)
+    diag_yy = p(diag_xx)
+    data = {"pred": pred_val, "true": true_val}
+    data = pd.DataFrame(data=data)
+    plot = sns.scatterplot(data, x="true", y="pred")
+    plt.plot(xx, yy)
+    plt.plot(diag_xx, diag_yy)
+    mae = "%.4g" % mae
+    plot.set(xlabel="True")
+    plot.set(ylabel="Predicted")
+    plot.set(title=f"MAE: {mae}")
+    plt.savefig(fname)
+    plt.close()
+    return mae
 
 def float_mask(tensor: torch.Tensor, dtype=torch.float32) -> torch.Tensor:
     """
@@ -153,17 +279,17 @@ def mask_counts(counts, training=False):
 
 
 
-count_mask = float_mask(counts)
-rel_abundance =_relative_abundance(counts)
-training = True
-count_attention_mask = count_mask
-rel_abundance, count_mask = mask_counts(rel_abundance, training=training)
-count_encoder = CountEncoderNetwork(embedding_dim=128, num_layers=2, num_heads=4, dropout_rate=0.1, intermediate_size=512, max_length=1000)
-base_embeddings = "DNABERT embeddings"
-count_gated_embeddings, count_pred = count_encoder(
-            base_embeddings,
-            rel_abundance,
-            attention_mask=count_attention_mask,
-            count_mask=count_mask,
-            training=training,
-        )
+# count_mask = float_mask(counts)
+# rel_abundance =_relative_abundance(counts)
+# training = True
+# count_attention_mask = count_mask
+# rel_abundance, count_mask = mask_counts(rel_abundance, training=training)
+# count_encoder = CountEncoderNetwork(embedding_dim=128, num_layers=2, num_heads=4, dropout_rate=0.1, intermediate_size=512, max_length=1000)
+# base_embeddings = "DNABERT embeddings"
+# count_gated_embeddings, count_pred = count_encoder(
+#             base_embeddings,
+#             rel_abundance,
+#             attention_mask=count_attention_mask,
+#             count_mask=count_mask,
+#             training=training,
+#         )

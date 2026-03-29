@@ -20,8 +20,10 @@ def compute_and_save_embeddings(sequences, tokenizer, model, output_path, batch_
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    # Process sequences in batches to save memory
-    sequence_items = list(sequences.items())
+    if isinstance(sequences, dict):
+        sequence_items = list(sequences.items())
+    else:
+        sequence_items = list(sequences)
     
     with h5py.File(output_path, 'w') as f:
         # Create a group for embeddings
