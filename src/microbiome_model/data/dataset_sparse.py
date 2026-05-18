@@ -82,7 +82,7 @@ class DonorAwareSampler(torch.utils.data.Sampler):
     
     
 class MicrobiomeSparseDataset(Dataset):
-    def __init__(self, biom_table, sample_targets, sort_asvs=True, embedding_loader=None, kmer_seqs=None, one_hot_seqs=None, test_split = False,random_vec=False, seed = None, env = None, sample_metadata = None, n_bins = 50, subsample= True):
+    def __init__(self, biom_table, sample_targets, sort_asvs=True, embedding_loader=None, kmer_seqs=None, one_hot_seqs=None, test_split = False,random_vec=False, seed = None, env = None, sample_metadata = None, n_bins = 50, subsample= True, clr = False):
         """
         Dataset class for sample-level microbiome data using disk-based embeddings.
         
@@ -91,7 +91,7 @@ class MicrobiomeSparseDataset(Dataset):
             embedding_path (str): Path to H5 file containing embeddings
             sample_targets (dict): Dictionary mapping sample IDs to target values
         """
-        self.biom_table = biom_table
+        self.biom_table =  biom_table.copy()
         self.sample_targets = sample_targets
         self.env = env
         if subsample:
@@ -102,10 +102,8 @@ class MicrobiomeSparseDataset(Dataset):
             else:
                 self.biom_data = biom_table.subsample(5000 , axis = "observation")
         else:
+            self.biom_data = biom_table.copy()
             print("Not subsampling data", biom_table.shape)
-            #subsample_seed2 = random.randint(0, 2**32 - 1)
-            self.biom_data = biom_table.subsample(5000, axis = "observation", seed = 44)
-            #print("Not subsampling data", biom_table.shape)
         self.sort_asvs = sort_asvs
         print("In data loader ", self.biom_data.shape)
         self.obs_ids = self.biom_data.ids(axis='observation')
@@ -120,6 +118,8 @@ class MicrobiomeSparseDataset(Dataset):
         self.sample_seasons = sample_metadata
         self.env_bool = None
         self.n_bins = n_bins
+        self.clr = clr
+        self.max_len = 1024
         if isinstance(self.env, tuple):
             if len(self.env) != 2:
                 raise ValueError("Expected tuple with exactly 2 elements (indoor_samples, outdoor_samples)")
@@ -131,14 +131,16 @@ class MicrobiomeSparseDataset(Dataset):
         
     
     
-    def sample_epoch_init(self, epoch, seed = False):
+    def sample_epoch_init(self, epoch, seed = True):
         
         if epoch > 0:
             print("Resubsampling data for epoch ", epoch)
             if seed:
                 subsample_seed = epoch + 42
                 print("Subsampling dataaaaa", subsample_seed)
+                print(self.biom_table.shape)
                 self.biom_data = self.biom_table.subsample(5000, axis = "observation", seed = subsample_seed)
+                
             else:
                 self.biom_data = self.biom_table.subsample(5000, axis = "observation")
 
@@ -191,11 +193,23 @@ class MicrobiomeSparseDataset(Dataset):
         #print(s_mask)
         abundances = self.table_data[0][s_mask]
         
-        
         s_obs = self.table_data[2][s_mask]
         s_obs_ids = self.obs_ids[s_obs]
-        abundances = abundances / (abundances.sum() + 1e-6) #account for varying sequencing depth by converting to relative abundances
-        abundances = abundances * 1e4  # Scale abundances for better numerical stability
+
+        # # In your dataset __getitem__:
+        # if len(abundances) > self.max_len:
+        #     # Keep top-k by abundance
+        #     top_k = np.argsort(abundances)[-self.max_len:]
+        #     s_obs_ids = s_obs_ids[top_k]
+        #     abundances = abundances[top_k]
+
+
+        if self.clr:
+            
+            abundances = self.clr_transform(torch.tensor(abundances, dtype=torch.float32)).numpy()
+        else:
+            abundances = abundances / (abundances.sum() + 1e-6) #account for varying sequencing depth by converting to relative abundances
+            abundances = abundances * 1e4  # Scale abundances for better numerical stability
 
         
         if len(abundances) > 0:
@@ -204,6 +218,10 @@ class MicrobiomeSparseDataset(Dataset):
             binned_abundances = (ranks / len(abundances) * self.n_bins).long() + 1
         else:
             binned_abundances = torch.empty(0, dtype=torch.long)
+
+        if self.clr and self.sort_asvs:
+            print("Warning: sort asvs is {self.sort_asvs} but CLR transform is applied, setting it to False.")
+            self.sort_asvs = False
 
         if self.sort_asvs:
             sorted_order = torch.argsort(abundances, descending=True)
@@ -233,6 +251,7 @@ class MicrobiomeSparseDataset(Dataset):
                     sample_embeddings_list = self.embedding_loader.get_embeddings_batch(s_obs_ids)
                     sample_embeddings = torch.stack(sample_embeddings_list)
                 else:
+                    
                     sample_embeddings = torch.stack([
                         self.embedding_loader.get_embedding(seq_id) for seq_id in s_obs_ids
                     ])
@@ -240,6 +259,8 @@ class MicrobiomeSparseDataset(Dataset):
                 # Sort indices in descending order based on abundances
 
 
+        if self.sort_asvs and len(abundances) > self.max_len:
+            sorted_order = sorted_order[:self.max_len]
         # Apply sorting
         abundances = abundances[sorted_order.numpy()].reshape(-1, 1)  # NumPy array indexing
         sample_embeddings = sample_embeddings[sorted_order]  # PyTorch tensor indexing
@@ -306,6 +327,7 @@ def collate_fn(batch):
     for i, seqs in enumerate(seqs_ids):
         padded_seqs_ids[i] = seqs + [None] * (max_len - len(seqs))
         
+    #targets = torch.log1p(targets)  # Log-transform targets for better numerical stability
     #print("Batch shape:", padded_abundances.shape)
     return {
         'SampleID': sample_ids,

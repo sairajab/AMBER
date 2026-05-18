@@ -48,6 +48,64 @@ class GradientReversalLayer(nn.Module):
 
 
 
+class MicrobiomeDeepSet(nn.Module):
+    def __init__(self, input_dim=128, hidden_dim=512, dropout=0.3):
+        super().__init__()
+        
+        # 1. Microbe-level feature extractor 
+        # (Learns what each ASV embedding means independently)
+        self.microbe_encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # 2. Sample-level regressor 
+        # (Takes the aggregated microbiome community and predicts age)
+        self.regressor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        # Safely initialize to the mean age (4.75 * 10 = 47.5)
+        nn.init.constant_(self.regressor[-1].bias, 4.75)
+
+    def forward(self, embeddings, abundances, masks):
+        # embeddings: [B, SeqLen, Dim]
+        # abundances: [B, SeqLen, 1]
+        
+        # 1. Extract features for every microbe independently
+        encoded_microbes = self.microbe_encoder(embeddings) # [B, SeqLen, Hidden]
+        
+        # 2. Smooth the abundances so the weighting isn't too extreme
+        # (10000 acts as a pseudo-count to spread out the relative abundances)
+        weights = torch.log1p(abundances * 10000.0) 
+        
+        # 3. Apply the abundance weights directly to the features
+        weighted_features = encoded_microbes * weights
+        
+        # 4. Mask out padded sequences
+        mask_expanded = masks.unsqueeze(-1)
+        weighted_features = weighted_features * mask_expanded
+        weights = weights * mask_expanded
+        
+        # 5. Global Weighted Average Pooling (The core of Deep Sets)
+        # Sum the weighted features, divide by the sum of the weights
+        summed_features = weighted_features.sum(dim=1)
+        summed_weights = weights.sum(dim=1).clamp(min=1e-6) # Prevent div by zero
+        
+        sample_representation = summed_features / summed_weights # [B, Hidden]
+        
+        # 6. Final Age Prediction
+        age_pred = self.regressor(sample_representation)
+        
+        return age_pred, None, None, None, None
+        
+
 
 class ASVClusterLayer(nn.Module):
     def __init__(
@@ -444,7 +502,7 @@ class BasicRegressorGRL(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, num_subjects) # Classifies "Who is this?"
         )
-        self.abundance_proj = nn.Linear(1, input_dim)
+        #self.abundance_proj = nn.Linear(1, input_dim)
 
         self.reset_parameters()
 
@@ -475,6 +533,8 @@ class BasicRegressorGRL(nn.Module):
         nn.init.zeros_(self._count_alpha)
 
     def forward(self, input_embeddings, abundances, masks, features=None, env=None, donor_ids=None):
+
+        print("Input embeddings shape:", input_embeddings.shape)
         # 1. Input Processing
         input_embeddings = self.scale_embeddings(input_embeddings)
         env_metadata = env is not None and (env != -1).any()
@@ -506,7 +566,7 @@ class BasicRegressorGRL(nn.Module):
         cls_mask = torch.ones(batch_size, 1, device=masks.device, dtype=masks.dtype)
         masks = torch.cat([cls_mask, masks], dim=1)
         attention_mask = ~masks.bool()  
-        abundances = self.abundance_proj(abundances)  # Project abundances to match embedding dimension
+        #abundances = self.abundance_proj(abundances)  # Project abundances to match embedding dimension
         
         if self.pe:
             weighted_embeddings = asv_embeddings + (self.pos_embedding(asv_embeddings) * abundances)
@@ -549,6 +609,201 @@ class BasicRegressorGRL(nn.Module):
         # Return 5 values to match the training loop:
         # age, counts, unifrac(None), diversity(None), subject_logits
         return age_prediction, count_pred, None, None, subject_logits
+from transformers.activations import gelu_new as gelu
+class BasicRegressorBest(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=1024, num_heads=4, num_layers=2, dropout=0.2, pe = False):
+        """
+        Regressor that processes multiple sequences per sample.
+        
+        Args:
+            input_dim (int): Dimension of input embeddings from DNABert2
+            hidden_dim (int): Dimension of hidden layers
+            num_heads (int): Number of attention heads
+            num_layers (int): Number of transformer encoder layers
+            dropout (float): Dropout rate
+        """
+        super().__init__()
+        self.pe = pe
+        self.input_dim = input_dim
+        # Add input normalization
+        #self.input_norm = nn.LayerNorm(input_dim)
+        # Initialize a learned query vector
+        self.scale_embeddings = nn.Sequential(
+            nn.Linear(768, 256),
+            nn.ReLU(),
+            nn.Linear(256, input_dim),
+            nn.LayerNorm(input_dim)
+        )
+
+        self.query_vector = nn.Parameter(torch.randn(1, 1, input_dim) / np.sqrt(input_dim))
+        
+        self._count_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        #self.sequence_embedding = nn.Linear(in_features=768, out_features=input_dim)
+        # Positional Embedding 
+        if self.pe:
+            self.pos_embedding = LearnablePositionalEmbedding(input_dim ,max_len=5000)
+                # Sequence-level transformer
+                
+        #original model has one layer only, I am trying to add one more layer to see the improvement
+        self.sequence_encoder = nn.TransformerEncoderLayer(
+        d_model=input_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim,
+                dropout=dropout,
+                activation= gelu,
+                batch_first=True,
+                )
+        self.sequence_attention = nn.TransformerEncoder(self.sequence_encoder, num_layers=num_layers)
+
+        
+        # self.sequence_encoder = TransformerEncoder(input_dim = input_dim,
+        #     hidden_dim = hidden_dim,
+        #     num_heads = num_heads,
+        #     num_layers = num_layers,
+        #     dropout= 0.2,
+        #     activation= "gelu",
+        #     batch_first = True) 
+        
+        self.gating_feature = nn.Linear(6, input_dim//2)
+        self.sample_encoder = nn.TransformerEncoderLayer(
+        d_model=input_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim,
+                dropout=dropout,
+                activation=gelu,
+                batch_first=True,)
+        self.sample_attention = nn.TransformerEncoder(self.sample_encoder, num_layers=num_layers)
+
+        self.norm = nn.LayerNorm(input_dim)
+
+
+        
+        self.count_out = nn.Linear(in_features= input_dim , out_features=1, bias=False)
+
+        self.dropout = nn.Dropout(dropout)
+        self.output_head = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1, bias=False)
+        )
+        
+        self.env_encoder = nn.Linear(1, input_dim//2)
+        #self.fc3 = nn.Linear(512, 1)
+        #self.fusion_layer = nn.Linear(input_dim + 1, input_dim)
+        #self.asv_dropout = nn.Dropout(0.1)
+        #self.donor_embedding = nn.Embedding(100, 768)
+        #self.attn_pooling = AttentionPooling(input_dim)
+        self.reset_parameters()
+
+
+
+
+    def reset_parameters(self):
+        """Initialize model parameters for better reproducibility and performance"""
+        
+        # For transformer-based models, use scaled initialization
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                # Use scaled normal initialization (similar to what BERT uses)
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Parameter):
+                nn.init.normal_(m, mean=0.0, std=0.02)
+
+        # Apply to custom layers only (don't reinitialize transformer layers)
+        self.output_head[0].apply(init_weights)
+        self.output_head[-1].apply(init_weights)
+        self.count_out.apply(init_weights)
+        
+        # Initialize positional embeddings if they exist
+        if self.pe:
+            nn.init.normal_(self.pos_embedding.position_embeddings.weight, mean=0.0, std=0.02)
+
+        # Initialize learnable parameters consistently
+        nn.init.normal_(self.query_vector, mean=0.0, std=0.02)
+        nn.init.zeros_(self._count_alpha)
+
+    def forward(self, input_embeddings, abundances, masks, features, env=None, donor_ids=None):
+        """
+        Forward pass with debugging information
+        """
+        #input_embeddings = self.asv_dropout(input_embeddings)
+        #input_embeddings = self.attn_pooling(input_embeddings)  # Apply attention pooling
+        #print("Input Embeddings Shape:", input_embeddings.shape)
+        input_embeddings = self.scale_embeddings(input_embeddings)
+        if env is not None:
+            env_embeddings = self.env_encoder(env.unsqueeze(-1))  # shape: [B, D]
+            #print(self.gating_feature(features).shape, env_embeddings.shape)
+            meta_embeddings = torch.cat([self.gating_feature(features), env_embeddings], dim=1)
+
+        #print("Meta Embeddings Shape:", meta_embeddings.shape)
+        feature_embeddings = nn.Sigmoid()(meta_embeddings)
+        input_embeddings = input_embeddings * feature_embeddings.unsqueeze(1)
+        
+        batch_size = input_embeddings.shape[0]
+        query_token = self.query_vector.expand(batch_size, -1, -1)  # shape: [B, 1, D]
+
+        asv_embeddings = torch.cat([query_token, input_embeddings], dim=1)  # [B, 1 + L, D]
+
+        abundances = abundances.transpose(1, 2)  # [B, C, L]
+        abundances = F.pad(abundances, pad=(1, 0), mode='constant', value=1)  # only pad left of L
+        #pad to right for env 
+        #abundances = F.pad(abundances, pad=(0, 1), mode='constant', value=1)  # only pad right for env
+        abundances = abundances.transpose(1, 2)  # [B, L+2, C]
+        
+        if self.training: 
+            abundances += torch.randn_like(abundances) * 0.01
+            dropout_mask = torch.rand_like(masks.float()) < 0.1
+            masks = masks.bool() & ~dropout_mask.bool()
+
+
+        cls_mask = torch.ones(batch_size, 1, device=masks.device, dtype=masks.dtype)
+        # env_mask = torch.ones(batch_size, 1, device=masks.device, dtype=masks.dtype)
+        masks = torch.cat([cls_mask, masks], dim=1)
+        attention_mask = ~masks.bool()  
+        
+        if self.pe:
+            #print(self.pos_embedding(asv_embeddings).max(), self.pos_embedding(asv_embeddings).min())
+            weighted_embeddings = asv_embeddings + self.pos_embedding(asv_embeddings) * abundances
+            #weighted_embeddings = torch.cat([weighted_embeddings, donor_embeddings], dim=1)
+
+            #fusion_input = torch.cat([self.pos_embedding(asv_embeddings), abundances], dim=-1)
+            #weighted_embeddings = self.fusion_layer(fusion_input)
+        else:
+            weighted_embeddings = asv_embeddings + asv_embeddings * abundances
+
+        # Process sequences with gradient checking
+        
+        count_embeddings = self.sequence_attention(
+            weighted_embeddings,
+            src_key_padding_mask=attention_mask
+        )  # 8 x no of ASvs x 786  
+        count_pred = count_embeddings[:, 1:, :]
+        count_pred = self.count_out(count_pred)
+        
+        count_alpha = F.softplus(self._count_alpha) 
+        sequence_encoded = asv_embeddings + count_embeddings * count_alpha
+
+        target_encoded = self.sample_attention(
+            sequence_encoded    ,
+            src_key_padding_mask=attention_mask
+        )
+        summary_token = target_encoded[:, 0, :]  # shape: [B, D]
+        summary_token = self.norm(summary_token)
+        # Final regression
+
+        x = self.output_head(summary_token)  # shape: [B, 1]
+    
+        
+        return x, count_pred , None
+    
 
 
 import torch

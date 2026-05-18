@@ -1,225 +1,207 @@
-import torch
+import os
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import GridSearchCV
-from torch.utils.data import DataLoader
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-import biom
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from evaluate import _mean_absolute_error
-from sklearn.model_selection import PredefinedSplit
-
+import biom
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import GridSearchCV, GroupKFold
 from sklearn.metrics import mean_absolute_error
-import numpy as np
 
 
-class RandomForestModel:
-    def __init__(self, **kwargs):
-        self.model = RandomForestRegressor(**kwargs)
-        self.max_len = 0
-    
-    def fit(self, train_loader):
-        X, y = self._flatten_dataloader(train_loader)
-        self.model.fit(X, y)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    def predict(self, loader):
-        X, _ = self._flatten_dataloader(loader)
-        preds = self.model.predict(X)
-        return preds
-
-    def evaluate(self, loader, out_dir):
-        X, y_true = self._flatten_dataloader(loader)
-        preds = self.model.predict(X)
-        print(out_dir)
-        mae = _mean_absolute_error(preds *100,y_true*100,  out_dir + "/test.png")
-        return mae
-
-    def _flatten_dataloader(self, loader):
-        # Collapse batched embeddings using mean pooling
-        X, y = [], []
-
-        for batch in loader:
-            emb = batch['embeddings']  # [B, L, D]
-            mask = batch['abundances']#.squeeze()  # [B, L, 1]
-            
-            pooled = (emb * mask)#.sum(dim=2) / mask.sum(dim=2).clamp(min=1e-6)
-
-            X.append(pooled.cpu().numpy())
-            y.append(batch['outdoor_add_0'].cpu().numpy())
-            print("batching")
-        
-        # max_len = max(arr.shape[1] for arr in X)
-        # print("Max length ", max_len)
-        # padded_arrays = []
-        # for arr in X:
-        #     pad_width = ((0, 0), (0, max_len - arr.shape[1]), (0, 0))  # pad only dim 1
-        #     padded = np.pad(arr, pad_width=pad_width, mode='constant', constant_values=0)
-        #     padded = padded.sum(dim=2)
-        #     padded_arrays.append(padded)
-        
-        X = np.vstack(X)
-        X = X.sum(axis=2)
-        if self.max_len == 0:
-            self.max_len = X.shape[1]
-        print("Max length ", self.max_len)
-        print("X shape ", X.shape)
-        pad_len = self.max_len - X.shape[1]  # how much to pad along the embedding dimension
-
-        if pad_len > 0:
-            pad_width = ((0, 0), (0, pad_len))  # pad axis=1 (columns)
-            padded = np.pad(X, pad_width=pad_width, mode='constant', constant_values=0)
-            X = padded
-            
-        y = np.concatenate(y).ravel()
-        print("X shape ", X.shape,)
-        print("y shape ", y.shape)
-        return X, y
+def donor_of(sample_id, meta_data, delimiter="."):
+    """Extract donor ID from a sample ID. Adjust delimiter to your format."""
+    sample_to_donor = dict(zip(meta_data["SampleID"], meta_data["DonorID"]))
+    return sample_to_donor.get(sample_id, None)
 
 
-# Function to extract data from DataLoader into NumPy arrays
-def extract_data(biom_file_path,target_file_path, test_host_id = "D12"):
-    
+def build_feature_matrix(table, sample_ids, metadata_df=None,
+                         use_env=False, use_bimonth=False):
+    """
+    Returns X aligned row-for-row with `sample_ids`.
+    Abundance features + optional metadata columns.
+    """
+    # Abundance matrix, explicitly reindexed to the requested sample order
+    abund = table.to_dataframe(dense=True).T          # [samples, asvs]
+    abund = abund.reindex(sample_ids)                  # enforce exact order
+    assert not abund.isnull().any().any(), "Missing samples after reindex"
+
+    X = abund.values.astype(np.float32)
+
+    extra = []
+    if use_env or use_bimonth:
+        md = metadata_df.set_index("SampleID").reindex(sample_ids)
+
+        if use_env:
+            env = (md["environment"] == "outdoor").astype(int).values.reshape(-1, 1)
+            extra.append(env)
+
+        if use_bimonth:
+            bimonth_oh = pd.get_dummies(md["bimonth"], prefix="bm")
+            # Ensure all 6 categories always present (consistent columns across folds)
+            for b in range(1, 7):
+                col = f"bm_{b}"
+                if col not in bimonth_oh.columns:
+                    bimonth_oh[col] = 0
+            bimonth_oh = bimonth_oh[[f"bm_{b}" for b in range(1, 7)]]
+            extra.append(bimonth_oh.values)
+
+    if extra:
+        X = np.hstack([X] + extra)
+
+    return X
+
+
+def load_data(biom_file_path, target_df, rarefaction_depth=5000, seed=42):
+    """Load table once, rarefy once (deterministically), build target map."""
     table = biom.load_table(biom_file_path)
-    table = table.filter(lambda val, id_, md: val.sum() > 0, axis='sample')
-    table = table.subsample(5000, axis='sample', with_replacement=True)
-    # abundance_data = table.to_dataframe()
-    
-    
-    targets_df = pd.read_csv(target_file_path)
-    sample_targets = dict(zip(targets_df['SampleID'], targets_df['outdoor_add_0']))
-    
-    test_ids = []
-    train_samples = []
+    table = table.filter(lambda v, i, m: v.sum() > 0, axis="sample")
 
-    sample_ids = list(sample_targets.keys())
-    
-    for id in sample_ids:
-        if test_host_id in id:
-            test_ids.append(id)
-        else:
-            train_samples.append(id) 
-    
-    X_train, y_train = [], []
-    
-    
-    train_val_table = table.filter(train_samples, inplace = False)
-    
-    train_ids, val_ids = train_test_split(train_samples, test_size=0.1, random_state=42)
+    # Deterministic single rarefaction shared across all folds.
+    # If you want to match SeqMiT's per-epoch rarefaction, that's a different
+    # design choice — but for a fair, reproducible RF baseline, fix it once.
+    np.random.seed(seed)
+    table = table.subsample(rarefaction_depth, axis="sample", with_replacement=True)
+
+    target_map = dict(zip(target_df["SampleID"], target_df["outdoor_add_0"]))
+
+    # Keep only samples present in both table and targets
+    table_ids = set(table.ids(axis="sample"))
+    valid_ids = [sid for sid in target_map if sid in table_ids]
+
+    return table, target_map, valid_ids
 
 
+# ---------------------------------------------------------------------------
+# Nested LOBO CV
+# ---------------------------------------------------------------------------
 
-    # print("Train ids ", train_ids)
-    # print("Val ids ", val_ids)
-    
-    train_table = train_val_table.filter(train_ids, inplace = False)
+def nested_lobo_cv(biom_file_path, target_df, output_dir="rf_results",
+                   metadata_path=None, use_env=False, use_bimonth=False,
+                   rarefaction_depth=5000, n_inner_folds=4, seed=42):
 
-    for train_id in train_ids:
+    os.makedirs(output_dir, exist_ok=True)
 
-    
-        targets = sample_targets[train_id] / 100.0  # Normalize by 100
-        y_train.append(targets)  # Convert tensor to NumPy
-        
-    abundances = train_table.to_dataframe().T
-    X_train.append(abundances)  # Convert tensor to NumPy 
-    
-    X_val, y_val = [], []
-    
-    val_table = train_val_table.filter(val_ids, inplace = False)
-    
-    for val_id in val_ids:
-        #abundances = abundance_data[val_id]
-        targets = sample_targets[val_id] / 100.0
-        
-        #X_val.append(abundances)  # Convert tensor to NumPy
-        y_val.append(targets)  # Convert tensor to NumPy
-    X_val.append(val_table.to_dataframe().T)  # Convert tensor to NumPy
-    
-    X_test, y_test = [], []
-    
-    test_table = table.filter(test_ids, inplace = False)
-    
-    #test_table = test_table.subsample(5000, axis='sample', with_replacement=True)
-    for test_id in test_ids:
+    table, target_map, valid_ids = load_data(
+        biom_file_path, target_df, rarefaction_depth, seed
+    )
 
-        #abundances = abundance_data[test_id]
-        targets = sample_targets[test_id] / 100.0
+    metadata_df = pd.read_csv(metadata_path) if (use_env or use_bimonth) else None
 
-    
-        #X_test.append(abundances)  # Convert tensor to NumPy
-        y_test.append(targets)  # Convert tensor to NumPy
-    X_test.append(test_table.to_dataframe().T)  # Convert tensor to NumPy
-    
-    return (np.vstack(X_train), np.vstack(y_train)), (np.vstack(X_val), np.vstack(y_val)), (np.vstack(X_test), np.vstack(y_test))
+    # Donor ID per sample (exact match, not substring)
+    donors = np.array([donor_of(sid, target_df) for sid in valid_ids])
+    unique_donors = sorted(set(donors))
+    print(f"{len(valid_ids)} samples across {len(unique_donors)} donors")
 
-def random_forest(biom_file_path,target_file_path, output_dir = "rf_results"):
-    
-    import os
-    if not os.path.exists(output_dir):
-        os.mkdir(output_dir)
-    
-    param_grid = {"max_depth": [None, 4],
-              "max_features": ['auto', 0.2],
-              "bootstrap": [True, False]}
-    
-    heldout_samples = ['D7','D8','D22','D13','D15', 'D28', 'D10', 'D17', 'D11''D19','D4','D26','D23','D29','D27','D20','D6','D25','D30',
-                        'D5','D21','D18','D14','D12','D24','D9','D16']
-    
+    param_grid = {
+        "max_depth": [None, 8, 16],
+        "max_features": ["sqrt", 0.2, 1.0],
+        "min_samples_leaf": [1, 3],
+    }
+
     results = {}
-    # Create a directory for each heldout sample
-    for j in range(len(heldout_samples)):
-        
-        xy_train, xy_val , xy_test = extract_data(biom_file_path,target_file_path, test_host_id = heldout_samples[j])
-        X_train, y_train = xy_train
-        X_test, y_test = xy_test
-        X_val, y_val = xy_val
-        print("Train data size ", X_train.shape , y_train.shape, len(X_train))
-        print("Test data size ", X_test.shape , y_test.shape)
-        print("Val data size ", X_val.shape , y_val.shape)
-        
-        X_all = np.concatenate([X_train, X_val])
-        y_all = np.concatenate([y_train, y_val])
-        
-        # Create test_fold array: -1 for train, 0 for val
-        test_fold = [-1] * len(X_train) + [0] * len(X_val)
-        
-        ps = PredefinedSplit(test_fold)
-        
+    print(unique_donors)
 
-        
+    # ---- Outer loop: leave one donor out ----
+    for held_donor in unique_donors:
+        test_mask = donors == held_donor
+        train_mask = ~test_mask
 
-        rf = RandomForestRegressor(n_estimators=500, random_state=999, criterion='absolute_error')
-        #grid search cv using rf and the hyperparameter grid on the inner_cv training set
-        rf_grid = GridSearchCV(estimator=rf, param_grid=param_grid, cv=ps, n_jobs=-1, scoring='neg_mean_absolute_error')
-        print("Running grid search ... ")
-        rf_grid.fit(X_all, y_all)
-        
-        res = ",".join(("{}={}".format(*i) for i in rf_grid.best_params_.items()))
+        test_ids = [sid for sid, m in zip(valid_ids, test_mask) if m]
+        train_ids = [sid for sid, m in zip(valid_ids, train_mask) if m]
 
-        print(res)
-        
-        yhat = rf_grid.predict(X_test)
-        #results = pd.DataFrame(y.iloc[test_ids])
-        #results['predicted_add'] = np.array(yhat)
-        # results.index.name = None
-        # print(results.to_csv(header=False), file=f)
-        MAE = _mean_absolute_error(yhat*100, y_test*100, f'heldout_samples[j].png')
-        print(f"Prediction score (MAE): {heldout_samples[j]}" ,MAE)
-        results[heldout_samples[j]] = MAE
-        
-    print("Results: ", results)
-    return results
+        if len(test_ids) == 0:
+            print(f"Skipping {held_donor}: no test samples")
+            continue
+
+        X_train = build_feature_matrix(table, train_ids, metadata_df,
+                                       use_env, use_bimonth)
+        X_test = build_feature_matrix(table, test_ids, metadata_df,
+                                      use_env, use_bimonth)
+
+        y_train = np.array([target_map[s] for s in train_ids]) / 100.0
+        y_test = np.array([target_map[s] for s in test_ids]) / 100.0
+
+        # ---- Inner loop: group-aware CV over training donors only ----
+        train_donor_labels = np.array([donor_of(s, target_df) for s in train_ids])
+        n_train_donors = len(set(train_donor_labels))
+        inner_splits = min(n_inner_folds, n_train_donors)
+
+        inner_cv = GroupKFold(n_splits=inner_splits)
+
+        rf = RandomForestRegressor(
+            n_estimators=500,
+            criterion="absolute_error",
+            random_state=seed,
+            n_jobs=-1,
+        )
+
+        grid = GridSearchCV(
+            estimator=rf,
+            param_grid=param_grid,
+            cv=inner_cv.split(X_train, y_train, groups=train_donor_labels),
+            scoring="neg_mean_absolute_error",
+            n_jobs=-1,
+            refit=True,
+        )
+
+        grid.fit(X_train, y_train)
+
+        y_pred = grid.predict(X_test)
+        mae = mean_absolute_error(y_test * 100, y_pred * 100)
+
+        results[held_donor] = {
+            "mae": float(mae),
+            "n_test": len(test_ids),
+            "best_params": grid.best_params_,
+        }
+        print(f"{held_donor:>5} | MAE={mae:7.2f} | n_test={len(test_ids):3d} "
+              f"| {grid.best_params_}")
+
+    # ---- Summary ----
+    maes = np.array([r["mae"] for r in results.values()])
+    print("\n" + "=" * 50)
+    print(f"LOBO mean MAE : {maes.mean():.2f} ± {maes.std():.2f}")
+    print(f"Median MAE    : {np.median(maes):.2f}")
+    print(f"Worst donor   : {max(results, key=lambda k: results[k]['mae'])} "
+          f"({maes.max():.2f})")
+    print(f"Best donor    : {min(results, key=lambda k: results[k]['mae'])} "
+          f"({maes.min():.2f})")
+
+    results_df = pd.DataFrame([
+        {"donor": k, "mae": v["mae"], "n_test": v["n_test"],
+         "best_params": str(v["best_params"])}
+        for k, v in results.items()
+    ])
+    results_df.to_csv(os.path.join(output_dir, "lobo_results.csv"), index=False)
+
+    return results, results_df
+
 
 if __name__ == "__main__":
-    biom_file_path = '../filtered_table.biom'
-    target_file_path = '../data/target_df.csv'
-    output_dir='rf_results'
-    # Run the random forest model
-    results = random_forest(biom_file_path, target_file_path, output_dir=output_dir)
-    # Print the results
-    print("Final results: ", results)
-    # Save the results to a CSV file
-    results_df = pd.DataFrame.from_dict(results, orient='index', columns=['MAE'])
-    results_df.to_csv(output_dir + '/rf_results.csv', index=True)
+    data_dir = "/s/chromatin/o/nobackup/Saira/Microbiome_Project/"
+    
+    biom_file_sheds = os.path.join(data_dir, "data/table_sheds_dada2.biom")
+    sheds_file = os.path.join(data_dir, "data/new_data/metadata_sheds.tsv")
+    sheds_df = pd.read_csv(sheds_file, sep="\t")
+    #sheds_df.index = "13810."+ sheds_df.index.astype(str) 
+    print(sheds_df.head())
 
+    nested_lobo_cv(
+        biom_file_path=biom_file_sheds,
+        target_df=sheds_df,
+        output_dir=os.path.join(data_dir, "microbiome_mode/results/rf_results_abundance"),
+        use_env=False, use_bimonth=False,
+    )
+
+    # --- RF + Env ---
+    # nested_lobo_cv(..., metadata_path="../data/metadata.csv",
+    #                use_env=True, use_bimonth=False,
+    #                output_dir="rf_results_env")
+
+    # --- RF + Env & Bimonth ---
+    # nested_lobo_cv(..., metadata_path="../data/metadata.csv",
+    #                use_env=True, use_bimonth=True,
+    #                output_dir="rf_results_env_bimonth")

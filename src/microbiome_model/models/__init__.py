@@ -3,7 +3,6 @@ import torch
 
 from microbiome_model.models.orig import (
     BasicRegressor,
-    BasicRegressorNew,
     BasicRegressorwithUnifrac,
 )
 from microbiome_model.models.zoo import (
@@ -26,6 +25,7 @@ def build_model(cfg: dict, device: str = "cpu"):
     - ``GeneralizedRegressor``
     - ``CLR``
     - ``ClusteredRegressor``
+    - ``AttnRegressor``
 
     For ``BasicRegressorNew`` the config may include
     ``pretrained_weights`` (absolute path to a ``.pt`` file).
@@ -41,7 +41,8 @@ def build_model(cfg: dict, device: str = "cpu"):
             dropout=cfg.get("dropout", 0.2),
             pe=cfg.get("pe", False),
             grl =cfg.get("grl", False),
-            unique_donors_train=cfg.get("num_donors", 0)
+            unique_donors_train=cfg.get("num_donors", 0),
+            clr =cfg.get("clr", False),
         )
 
     elif name == "BasicRegressorGRL":
@@ -100,9 +101,18 @@ def build_model(cfg: dict, device: str = "cpu"):
             dropout=cfg.get("dropout", 0.2),
         )
 
+    elif name == "AttnRegressor":
+        return AttnRegressor(
+            input_dim=cfg.get("input_dim", 512),
+            hidden_dim=cfg.get("hidden_dim", 512),
+            num_heads=cfg.get("num_heads", 8),
+            num_layers=cfg.get("num_layers", 2),
+            dropout=cfg.get("dropout", 0.2),
+        )
+
     else:
         raise ValueError(
             f"Unknown model_name: {name!r}. "
             "Supported: BasicRegressor, BasicRegressorGRL, BasicRegressorNew, "
-            "GeneralizedRegressor, CLR, ClusteredRegressor."
+            "GeneralizedRegressor, CLR, ClusteredRegressor, AttnRegressor."
         )

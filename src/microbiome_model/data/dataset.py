@@ -15,7 +15,7 @@ from sklearn.model_selection import train_test_split
 
 
 from microbiome_model.data.dataset_sparse import MicrobiomeSparseDataset
-from microbiome_model.data.embedding_loader import compute_and_save_embeddings
+from microbiome_model.data.embedding_loader import compute_and_save_embeddings, compute_and_save_token_embeddings, compute_and_save_embeddings_fast
 from microbiome_model.data.optimized_embedding_loader import MemoryMappedEmbeddingLoader as EmbeddingLoader 
 
 
@@ -167,6 +167,8 @@ def self_trained_mlm(embedding_path, sequences, device):
     model = AutoModel.from_pretrained(model_path)
     model = model.to(device)
     model.eval()  # Disable dropout etc.
+
+
     compute_and_save_embeddings(
         sequences=sequences,
         tokenizer=tokenizer,
@@ -181,10 +183,22 @@ def dna_bert(embedding_path, sequences, device):
     
             config = BertConfig.from_pretrained("zhihan1996/DNABERT-2-117M")
             tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True)
-            dnabert_model = AutoModel.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True, config=config)
-            dnabert_model = dnabert_model.to(device)
 
-            
+            config.use_flash_attn = False  # disable flash attention, use_flash_attn
+            # OR
+            config._attn_implementation = "eager"  # force standard attention
+
+            print("Loading DNABERT model with config:", config)
+
+            dnabert_model = AutoModel.from_pretrained(
+                "zhihan1996/DNABERT-2-117M",
+                trust_remote_code=True,
+                config=config,
+                attn_implementation="eager"  # add this
+            )
+            #dnabert_model = AutoModel.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True, config=config)
+            dnabert_model = dnabert_model.to(device)
+            print("DNABERT model loaded and moved to device.")
             compute_and_save_embeddings(
                     sequences=sequences,
                     tokenizer=tokenizer,
@@ -198,12 +212,21 @@ def dna_bert(embedding_path, sequences, device):
             torch.cuda.empty_cache()
 
 def finetuned_dna_bert(embedding_path, sequences, device):
-            checkpoint_path = "/s/chromatin/o/nobackup/Saira/Microbiome_Project/initial_exps_microbiome/src/dnabert-finetuned-16s-no-pad/checkpoint-37170"
-
+            print("Loading fine-tuned DNABERT model...")
+            checkpoint_path_old = "/s/chromatin/o/nobackup/Saira/Microbiome_Project/initial_exps_microbiome/src/dnabert-finetuned-16s-no-pad/checkpoint-37170"
+            checkpoint_path = "/s/chromatin/o/nobackup/Saira/Microbiome_Project/dnabert-finetuned-16s/checkpoint-234774"
             tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
             finetuned_model = AutoModel.from_pretrained(checkpoint_path,trust_remote_code=True)
             dnabert_model = finetuned_model.to(device)
-            compute_and_save_embeddings(
+            # compute_and_save_embeddings(
+            #     sequences=sequences,
+            #     tokenizer=tokenizer,
+            #     model=dnabert_model,
+            #     output_path=embedding_path,
+            #     device=device
+            # )
+
+            compute_and_save_token_embeddings(
                 sequences=sequences,
                 tokenizer=tokenizer,
                 model=dnabert_model,
@@ -214,6 +237,34 @@ def finetuned_dna_bert(embedding_path, sequences, device):
             # Free up memory
             #del dnabert_model
             torch.cuda.empty_cache()
+
+def s_dnabert(embedding_path, sequences, device):
+            print("Loading S-DNABERT model...")
+            tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-S", trust_remote_code=True)
+            model = AutoModel.from_pretrained("zhihan1996/DNABERT-S", trust_remote_code=True)
+            dnabert_model = model.to(device)
+            # compute_and_save_embeddings(
+            #     sequences=sequences,
+            #     tokenizer=tokenizer,
+            #     model=dnabert_model,
+            #     output_path=embedding_path,
+            #     device=device
+            # )
+
+            compute_and_save_embeddings_fast(
+                sequences=sequences,
+                tokenizer=tokenizer,
+                model=dnabert_model,
+                output_path=embedding_path,
+                batch_size=1024,  # Adjust batch size as needed
+                device=device,
+                pooling = "mean"
+            )
+            
+            # Free up memory
+            #del dnabert_model
+            torch.cuda.empty_cache()
+
 
 
 
@@ -326,12 +377,18 @@ class DataProcessor:
             }
         elif column == "bi_month_name":
             _map = {
-                "Jan-Feb": [1, 0, 0, 0, 0, 0],
-                "Mar-Apr": [0, 1, 0, 0, 0, 0],
-                "May-Jun": [0, 0, 1, 0, 0, 0],
-                "Jul-Aug": [0, 0, 0, 1, 0, 0],
-                "Sep-Oct": [0, 0, 0, 0, 1, 0],
-                "Nov-Dec": [0, 0, 0, 0, 0, 1],
+                # "Jan-Feb": [1, 0, 0, 0, 0, 0],
+                # "Mar-Apr": [0, 1, 0, 0, 0, 0],
+                # "May-Jun": [0, 0, 1, 0, 0, 0],
+                # "Jul-Aug": [0, 0, 0, 1, 0, 0],
+                # "Sep-Oct": [0, 0, 0, 0, 1, 0],
+                # "Nov-Dec": [0, 0, 0, 0, 0, 1],
+                "Jan-Feb": 0,
+                "Mar-Apr": 1,
+                "May-Jun": 2,
+                "Jul-Aug": 3,
+                "Sep-Oct": 4,
+                "Nov-Dec": 5,
             }
         else:
             raise ValueError(f"Unknown metadata column: {column}")
@@ -404,7 +461,8 @@ class DataProcessor:
             if not os.path.exists(self.config.embedding_file):
                 print("Computing embeddings...")
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                finetuned_dna_bert(self.config.embedding_file, self.sequences, device)
+                s_dnabert(self.config.embedding_file, self.sequences, device)
+                #dna_bert(self.config.embedding_file, self.sequences, device)
             return self.config.embedding_file
         
     def match_samples(self):
@@ -598,15 +656,15 @@ class DataProcessor:
         
         return new_train_samples, val_samples
     
-    def sample_data(self, epoch):
+    def sample_data(self, epoch, subsample = True, random_vector=False):
     # Create datasets
 
         train_samples, train_targets = self.train_data
         
         if self.val_data is None and epoch ==0:
-            #train_samples, val_samples = train_test_split(train_samples, test_size=0.1 , random_state=42)
+            train_samples, val_samples = train_test_split(train_samples, test_size=0.1 , random_state=42)
             #train_samples, val_samples = self.donor_aware_split(train_samples, val_ratio=0.1)
-            train_samples, val_samples = self.stratified_donor_split(train_samples, val_ratio=0.1)
+            #train_samples, val_samples = self.stratified_donor_split(train_samples, val_ratio=0.1)
             train_targets = {sample_id: self.sample_targets[sample_id] for sample_id in train_samples}
             val_targets = {sample_id: self.sample_targets[sample_id] for sample_id in val_samples}
             self.val_data = (val_samples, val_targets)
@@ -656,7 +714,9 @@ class DataProcessor:
                     random_vec=False,
                     seed = epoch,
                     env = (self.indoor_samples, self.outdoor_samples) ,
-                    sample_metadata=self.sample_seasons
+                    sample_metadata=self.sample_seasons,
+                    clr = self.config.clr,
+                    subsample=subsample
                 )
                 
             val_dataset = MicrobiomeSparseDataset(
@@ -665,9 +725,11 @@ class DataProcessor:
                         sort_asvs=self.config.sort_asvs,
                         embedding_loader=embedding_loader,
                         random_vec=False,
-                        seed = 9999 ,
+                        seed = epoch ,
                         env = (self.indoor_samples, self.outdoor_samples),
-                        sample_metadata=self.sample_seasons
+                        sample_metadata=self.sample_seasons,
+                        clr = self.config.clr,
+                        subsample=subsample
                     )
         elif self.config.kmer_embeddings and self.config.embedding_file is None:
             # Use the kmer_seqs to create the dataset
@@ -682,7 +744,7 @@ class DataProcessor:
                         sort_asvs=self.config.sort_asvs,
                         kmer_seqs=self.seqs_processed,
                         sample_targets=val_targets, random_vec=False,
-                        seed=9999
+                        seed=epoch
                     )
         
         train_y = train_dataset.get_targets()
@@ -692,7 +754,7 @@ class DataProcessor:
 
         return train_dataset, val_dataset
 
-    def sample_test_data(self, random_vector=False):
+    def sample_test_data(self, epoch = 0, subsample = True,random_vector=False):
 
         test_samples, test_targets = self.test_data
         test_table = self.table.filter(test_samples, inplace=False)
@@ -705,8 +767,8 @@ class DataProcessor:
                     sort_asvs=self.config.sort_asvs,
                     sample_targets=test_targets, 
                     random_vec=random_vector, 
-                    seed = None,
-                    subsample=False
+                    seed = epoch,
+                    subsample=subsample
                 )
         elif not self.config.kmer_embeddings and self.config.embedding_file is not None:
             # Use the embedding path to create the dataset
@@ -717,10 +779,11 @@ class DataProcessor:
                     sort_asvs=self.config.sort_asvs,
                     embedding_loader=embedding_loader,
                     random_vec=random_vector,
-                    seed = None,
+                    seed = epoch,
                     env = (self.indoor_samples, self.outdoor_samples),
                     sample_metadata=self.sample_seasons,
-                    subsample=False
+                    subsample=subsample,
+                    clr = self.config.clr
                 )
         elif self.config.kmer_embeddings and self.config.embedding_file is None:
             # Use the kmer_seqs to create the dataset
@@ -729,7 +792,7 @@ class DataProcessor:
                     kmer_seqs=self.seqs_processed,
                     sort_asvs=self.config.sort_asvs,
                     sample_targets=test_targets, random_vec=random_vector,
-                    subsample=False
+                    subsample=subsample
                 )
         else:
             raise ValueError("Unknown configuration for test data sampling.")
@@ -802,11 +865,13 @@ class DataProcessor:
             test_dataset = MicrobiomeSparseDataset(
                 biom_table=test_table,
                 sample_targets=test_targets,
+                sort_asvs=self.config.sort_asvs,
                 embedding_loader=embedding_loader,
                 random_vec=random_vector,
                 seed=None,
                 env=(self.indoor_samples, self.outdoor_samples),
-                sample_metadata=self.sample_seasons
+                sample_metadata=self.sample_seasons,
+                subsample=False
             )
 
         elif self.config.kmer_embeddings and self.config.embedding_file is None:
@@ -827,12 +892,13 @@ class DataProcessor:
 
 
 class Arguments:
-    def __init__(self, biom_file, metadata_file, embedding_file, tree_path = None,  heldout = "D12", embedding="DNABERT", normalize=False, sort_asvs=False):
+    def __init__(self, biom_file, metadata_file, embedding_file, tree_path = None,  heldout = "D12", embedding="DNABERT", normalize=False, sort_asvs=False, clr = False):
         
         self.normalize = normalize
         self.heldout = heldout
         self.embedding = embedding
         self.sort_asvs = sort_asvs
+        self.clr = clr
         self.biom_file = biom_file
         self.metadata_file = metadata_file
         self.embedding_file = embedding_file

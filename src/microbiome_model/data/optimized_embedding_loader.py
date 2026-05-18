@@ -150,8 +150,10 @@ class MemoryMappedEmbeddingLoader:
                 if embedding_dim is None:
                     embedding_dim = emb.shape[-1]
                 
+                print(f"Embedding shape for {seq_id}: {emb.shape}")  # Debugging line
                 embeddings_list.append(emb.flatten())
                 sequence_index[seq_id] = i
+
         
         # Stack all embeddings
         all_embeddings = np.vstack(embeddings_list).astype(np.float32)
@@ -167,6 +169,58 @@ class MemoryMappedEmbeddingLoader:
             pickle.dump({'index': sequence_index, 'embedding_dim': embedding_dim}, f)
         
         print(f"Saved {len(sequence_index)} embeddings to memory-mapped format")
+
+    
+    def _convert_to_mmap_tokens(self):
+        print("Converting H5 to memory-mapped format...")
+
+        flat_embeddings = []
+        index = {}
+
+        offset = 0
+        embedding_dim = None
+
+        with h5py.File(self.embedding_path, 'r') as f:
+            emb_group = f['embeddings']
+
+            for seq_id in tqdm(emb_group.keys(), desc="Converting"):
+                emb = emb_group[seq_id][()]   # [seq_len, hidden_dim]
+
+                if embedding_dim is None:
+                    embedding_dim = emb.shape[1]
+
+                seq_len = emb.shape[0]
+
+                # store start + length instead of index
+                index[seq_id] = (offset, seq_len)
+
+                flat_embeddings.append(emb.astype(np.float32))
+                offset += seq_len
+
+        # concatenate along token dimension
+        all_embeddings = np.concatenate(flat_embeddings, axis=0)  # [total_tokens, hidden_dim]
+
+        print("Final mmap shape:", all_embeddings.shape)
+
+        mmap_array = np.memmap(
+            self.mmap_path,
+            dtype=np.float32,
+            mode='w+',
+            shape=all_embeddings.shape
+        )
+
+        mmap_array[:] = all_embeddings[:]
+        del mmap_array
+
+        # save index
+        with open(self.index_path, 'wb') as f:
+            pickle.dump({
+                'index': index,
+                'embedding_dim': embedding_dim
+            }, f)
+
+        print(f"Saved {len(index)} sequences with total tokens {all_embeddings.shape[0]}")
+
     
     def _load_mmap(self):
         """Load memory-mapped array and index"""
@@ -191,6 +245,217 @@ class MemoryMappedEmbeddingLoader:
         batch_embeddings = self.embeddings[indices]
         return [torch.from_numpy(emb.copy()) for emb in batch_embeddings]
 
+
+class MemoryMappedEmbeddingLoaderNew2:
+    """Efficient loader for contiguous HDF5 embeddings with optional mmap."""
+
+    def __init__(self, embedding_path, convert_to_mmap=False, preload_all=False):
+        self.embedding_path = embedding_path
+        self.mmap_path = embedding_path.replace('.h5', '.mmap')
+        convert_to_mmap = True  # Force conversion for testing
+        self.use_mmap = convert_to_mmap or os.path.exists(self.mmap_path)
+        print(f"Initialized loader with strategy: {'Memory-mapped' if self.use_mmap else 'HDF5'}")
+        if self.use_mmap:
+            print("Using memory-mapped loading strategy")
+            self._load_or_create_mmap()
+        else:
+            self._load_hdf5(preload_all)
+
+    # -------------------------
+    # HDF5 LOADING
+    # -------------------------
+    def _load_hdf5(self, preload_all):
+        self.h5 = h5py.File(self.embedding_path, 'r')
+
+        self.embeddings = self.h5["embeddings"]
+        self.ids = self.h5["ids"][:].astype(str)
+
+        # Map id → index
+        self.id_to_idx = {id_: i for i, id_ in enumerate(self.ids)}
+
+        if preload_all:
+            print("⚡ Preloading embeddings into RAM...")
+            self.embeddings = self.embeddings[:]
+
+        self.shape = self.embeddings.shape
+
+    # -------------------------
+    # MMAP CONVERSION
+    # -------------------------
+    def _load_or_create_mmap(self):
+        import numpy as np
+        import h5py
+        import os
+
+        meta_path = self.mmap_path + "_meta.npy"
+        ids_path = self.mmap_path + "_ids.npy"
+
+        # -------------------------
+        # CREATE MMAP IF NEEDED
+        # -------------------------
+        if not os.path.exists(self.mmap_path):
+            print("🔄 Converting HDF5 → memory-mapped file...")
+
+            with h5py.File(self.embedding_path, 'r') as f:
+                embeddings = f["embeddings"][:]   # shape (N, D)
+                ids = f["ids"][:].astype(str)
+
+            shape = embeddings.shape
+
+            # Create mmap with CORRECT shape
+            fp = np.memmap(
+                self.mmap_path,
+                dtype='float32',
+                mode='w+',
+                shape=shape
+            )
+            fp[:] = embeddings[:]
+            del fp  # flush
+
+            # Save metadata
+            np.save(meta_path, np.array(shape))
+            np.save(ids_path, ids)
+
+        # -------------------------
+        # LOAD MMAP
+        # -------------------------
+        shape = tuple(np.load(meta_path))
+        ids = np.load(ids_path, allow_pickle=True)
+
+        self.embeddings = np.memmap(
+            self.mmap_path,
+            dtype='float32',
+            mode='r',
+            shape=shape
+        )
+
+        self.ids = ids
+        self.id_to_idx = {id_: i for i, id_ in enumerate(ids)}
+        self.shape = shape
+
+    # -------------------------
+    # ACCESS METHODS
+    # -------------------------
+    def get_embedding(self, seq_id):
+        idx = self.id_to_idx[str(seq_id)]
+        
+        return torch.from_numpy(self.embeddings[idx].copy())
+
+    def get_batch_embeddings(self, seq_ids):
+        indices = [self.id_to_idx[str(i)] for i in seq_ids]
+        return [torch.from_numpy(self.embeddings[idx].copy()) for idx in indices]
+
+    def __len__(self):
+        return self.shape[0]
+    
+class MemoryMappedEmbeddingLoaderNew:
+    """Memory-mapped loader for variable-length token embeddings"""
+
+    def __init__(self, embedding_path, convert_to_mmap=False, preload_all=False):
+        self.embedding_path = embedding_path
+        self.mmap_path = embedding_path.replace('.h5', '.mmap')
+        self.index_path = embedding_path.replace('.h5', '_index.pkl')
+
+        if convert_to_mmap or not os.path.exists(self.mmap_path):
+            self._convert_to_mmap_tokens()
+
+        self._load_mmap()
+
+    # -------------------------------
+    # ✅ CORRECT conversion
+    # -------------------------------
+    def _convert_to_mmap_tokens(self):
+        print("Converting H5 → mmap (token mode)...")
+
+        flat_embeddings = []
+        index = {}
+
+        offset = 0
+        embedding_dim = None
+
+        with h5py.File(self.embedding_path, 'r') as f:
+            emb_group = f['embeddings']
+
+            for seq_id in tqdm(emb_group.keys(), desc="Converting"):
+                emb = emb_group[seq_id][()]  # [seq_len, hidden_dim]
+
+                if embedding_dim is None:
+                    embedding_dim = emb.shape[1]
+
+                seq_len = emb.shape[0]
+
+                index[seq_id] = (offset, seq_len)
+
+                flat_embeddings.append(emb.astype(np.float32))
+                offset += seq_len
+
+        all_embeddings = np.concatenate(flat_embeddings, axis=0)
+
+        print("Final mmap shape:", all_embeddings.shape)
+
+        mmap_array = np.memmap(
+            self.mmap_path,
+            dtype=np.float32,
+            mode='w+',
+            shape=all_embeddings.shape
+        )
+
+        mmap_array[:] = all_embeddings[:]
+        del mmap_array
+
+        with open(self.index_path, 'wb') as f:
+            pickle.dump({
+                'index': index,
+                'embedding_dim': embedding_dim,
+                'total_tokens': all_embeddings.shape[0]
+            }, f)
+
+        print(f"Saved {len(index)} sequences")
+
+    # -------------------------------
+    # ✅ FIXED loader
+    # -------------------------------
+    def _load_mmap(self):
+        with open(self.index_path, 'rb') as f:
+            data = pickle.load(f)
+
+        self.sequence_index = data['index']
+        self.embedding_dim = data['embedding_dim']
+        self.total_tokens = data['total_tokens']
+
+        # ⚠️ reshape to (total_tokens, dim)
+        self.embeddings = np.memmap(
+            self.mmap_path,
+            dtype=np.float32,
+            mode='r',
+            shape=(self.total_tokens, self.embedding_dim)
+        )
+
+    # -------------------------------
+    # ✅ Single sequence
+    # -------------------------------
+    def get_embedding(self, sequence_id):
+        start, length = self.sequence_index[sequence_id]
+
+        emb = self.embeddings[start:start + length]  # [seq_len, dim]
+
+        return torch.from_numpy(emb.copy())
+
+    # -------------------------------
+    # ✅ Batch (variable length)
+    # -------------------------------
+    def get_embeddings_batch(self, sequence_ids):
+        batch = []
+        lengths = []
+
+        for seq_id in sequence_ids:
+            start, length = self.sequence_index[seq_id]
+            emb = self.embeddings[start:start + length]
+            batch.append(torch.from_numpy(emb.copy()))
+            lengths.append(length)
+
+        return batch, lengths
+    
 class StreamingEmbeddingLoader:
     """Streaming loader that processes embeddings on-demand with minimal memory"""
     

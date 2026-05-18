@@ -2,18 +2,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def compute_count_loss(relative_counts, count_pred, loss_type='mse'):
+def compute_count_loss(relative_counts, count_pred, masks = None, loss_type='mse'):
         
+        #print("relative counts ", relative_counts.shape, count_pred.shape)
+        if masks is not None:
+            masks = masks.bool()
+            relative_counts = relative_counts[masks]
+            count_pred = count_pred[masks]
+            #print("mask applied ", masks.sum(), relative_counts.shape, count_pred.shape)
+
         #print(torch.abs(relative_counts - count_pred).max(), torch.abs(relative_counts - count_pred).min(), torch.abs(relative_counts - count_pred).median())
         if loss_type == 'mse':
             if relative_counts.shape != count_pred.shape:
                 relative_counts = relative_counts.unsqueeze(-1)  # [B, L] -> [B, L, 1]
-            loss = torch.square(relative_counts - count_pred)
+
+            loss = torch.square(relative_counts - count_pred)  # Weighted MSE
+            #loss = torch.square(relative_counts - count_pred) 
         else:
             loss = F.smooth_l1_loss(count_pred, relative_counts, beta=0.2, reduction='none')  # Huber loss
         #print("Count Loss ", loss.shape)
         return torch.squeeze(loss, axis=-1)
     
+
+def distance_weighted_ce(targets, logits, num_bins, alpha=1.0, mask=None):
+    # mask: (B, L) with 1 for valid positions, 0 for padding
+    log_probs = F.log_softmax(logits, dim=-1)
+    bins = torch.arange(num_bins, device=logits.device)
+    distances = (bins - targets.unsqueeze(-1)).abs().float()
+    weights = 1 + alpha * distances
+    per_position_loss = -(log_probs * weights).sum(dim=-1)  # (B, L)
+    
+    if mask is not None:
+        per_position_loss = per_position_loss * mask
+        # average over valid positions only
+        per_sample_loss = per_position_loss.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    else:
+        per_sample_loss = per_position_loss.mean(dim=1)
+    return per_sample_loss.mean()
 
 def compute_nuc_loss(tokens, nuc_pred, mask=None):
     """
