@@ -1,0 +1,46 @@
+name: microbiome_model
+
+channels:
+  - conda-forge
+  - pytorch
+  - bioconda
+  - defaults
+
+dependencies:
+  - python=3.9
+  - pip
+  - numpy=1.23.5
+  - scipy=1.10.1
+  - pandas=2.0.3
+  - matplotlib=3.7.2
+  - scikit-learn=1.6.1
+  - h5py=3.12.1
+  - pyyaml=6.0.2
+  - ipykernel
+  - unifrac-binaries=1.4
+
+  - pip:
+      - torch==2.8.0
+      - torchvision==0.23.0
+      - transformers==4.54.1
+      - tokenizers==0.21.4
+      - datasets==4.0.0
+      - accelerate==1.8.1
+      - einops==0.8.1
+      - shap==0.48.0
+      - captum==0.8.0
+      - optuna==4.8.0
+      - wandb==0.26.0
+      - seaborn==0.13.2
+      - joblib==1.4.2
+      - biom-format==2.1.16
+      - scikit-bio==0.6.2
+      - unifrac==0.20.3
+      - tensorflow==2.14.1
+      - tqdm==4.66.6
+      - biopython==1.85
+      - -e .
+
+# Note: baselines/rf.py imports `qiime2`, which is not installable via pip/conda-forge.
+# It requires a separate QIIME 2 distribution environment (see the qiime2-amplicon-2024.5
+# env on this machine) and is not part of this environment.

@@ -1,0 +1,16 @@
+# experiment / run artifacts
+results/
+logs/
+wandb/
+sweep.log
+sweep.err
+*.log
+bin_boundaries.npy
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# notebooks
+.ipynb_checkpoints/
+

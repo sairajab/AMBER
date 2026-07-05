@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microbiome_model"
+version = "0.1.0"
+description = "AMBER - Abundance-Modulated Bi-EncodeR"
+requires-python = ">=3.9,<3.10"
+dependencies = [
+    "numpy==1.23.5",
+    "scipy==1.10.1",
+    "pandas==2.0.3",
+    "matplotlib==3.7.2",
+    "seaborn==0.13.2",
+    "scikit-learn==1.6.1",
+    "h5py==3.12.1",
+    "pyyaml==6.0.2",
+    "joblib==1.4.2",
+    "tqdm==4.66.6",
+    "biopython==1.85",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "transformers==4.54.1",
+    "tokenizers==0.21.4",
+    "datasets==4.0.0",
+    "accelerate==1.8.1",
+    "einops==0.8.1",
+    "shap==0.48.0",
+    "captum==0.8.0",
+    "optuna==4.8.0",
+    "wandb==0.26.0",
+    "biom-format==2.1.16",
+    "scikit-bio==0.6.2",
+    "unifrac==0.20.3",
+    "tensorflow==2.14.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
