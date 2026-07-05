@@ -9,7 +9,7 @@ import math
 from itertools import product
 from microbiome_model.models.transformers import TransformerEncoder, ReZeroTransformerEncoder
 from microbiome_model.models.nt_model import NucleotideTransformer, ASVEncoder, ASVEncoderWithTransformer
-
+from microbiome_model.models.orig import AttentionPool
 bases = ['A', 'C', 'G', 'T']
 kmers = [''.join(p) for p in product(bases, repeat=3)]
 kmer_to_index = {kmer: idx for idx, kmer in enumerate(kmers)}
@@ -610,6 +610,8 @@ class BasicRegressorGRL(nn.Module):
         # age, counts, unifrac(None), diversity(None), subject_logits
         return age_prediction, count_pred, None, None, subject_logits
 from transformers.activations import gelu_new as gelu
+
+
 class BasicRegressorBest(nn.Module):
     def __init__(self, input_dim=768, hidden_dim=1024, num_heads=4, num_layers=2, dropout=0.2, pe = False):
         """
@@ -738,12 +740,14 @@ class BasicRegressorBest(nn.Module):
         #input_embeddings = self.attn_pooling(input_embeddings)  # Apply attention pooling
         #print("Input Embeddings Shape:", input_embeddings.shape)
         input_embeddings = self.scale_embeddings(input_embeddings)
-        if env is not None:
+        if features is not None:
+            env = features[:,0:1].float()  # Assuming env is the first column of features
             env_embeddings = self.env_encoder(env.unsqueeze(-1))  # shape: [B, D]
             #print(self.gating_feature(features).shape, env_embeddings.shape)
-            meta_embeddings = torch.cat([self.gating_feature(features), env_embeddings], dim=1)
+            #print(features, env)
+            feature_embeddings = self.gating_feature(F.one_hot(features[:, 1:].long(), num_classes=6).float())  # Remaining features after extracting env
+            meta_embeddings = torch.cat([feature_embeddings.squeeze(1), env_embeddings.squeeze(1)], dim=1)
 
-        #print("Meta Embeddings Shape:", meta_embeddings.shape)
         feature_embeddings = nn.Sigmoid()(meta_embeddings)
         input_embeddings = input_embeddings * feature_embeddings.unsqueeze(1)
         
@@ -758,10 +762,10 @@ class BasicRegressorBest(nn.Module):
         #abundances = F.pad(abundances, pad=(0, 1), mode='constant', value=1)  # only pad right for env
         abundances = abundances.transpose(1, 2)  # [B, L+2, C]
         
-        if self.training: 
-            abundances += torch.randn_like(abundances) * 0.01
-            dropout_mask = torch.rand_like(masks.float()) < 0.1
-            masks = masks.bool() & ~dropout_mask.bool()
+        # if self.training: 
+        #     abundances += torch.randn_like(abundances) * 0.01
+        #     dropout_mask = torch.rand_like(masks.float()) < 0.1
+        #     masks = masks.bool() & ~dropout_mask.bool()
 
 
         cls_mask = torch.ones(batch_size, 1, device=masks.device, dtype=masks.dtype)
@@ -802,8 +806,1202 @@ class BasicRegressorBest(nn.Module):
         x = self.output_head(summary_token)  # shape: [B, 1]
     
         
-        return x, count_pred , None
+        return x, count_pred , None, None, None
     
+
+
+class BasicRegressor1(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=1024, num_heads=4,
+                 num_layers=2, dropout=0.2, pe=False,
+                 metadata_cardinalities=None,   # e.g. [2, 6] -> env(2), bimonth(6)
+                 grl=False, clr=False, unique_donors_train=106):
+        super().__init__()
+        self.pe = pe
+        self.clr = clr
+        self.grl = grl
+        self.input_dim = input_dim
+
+        self.scale_embeddings = nn.Sequential(
+            nn.Linear(768, input_dim),
+         nn.LayerNorm(input_dim),
+        )
+        self.query_vector = nn.Parameter(torch.randn(1, 1, input_dim) / np.sqrt(input_dim))
+
+        if self.pe:
+            self.pos_embedding = LearnablePositionalEmbedding(input_dim, max_len=5000)
+
+        self.sequence_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sequence_attention = nn.TransformerEncoder(self.sequence_encoder, num_layers)
+
+        self.metadata_cardinalities = metadata_cardinalities or []
+        self.metadata_embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=card + 1,   # +1 for an optional pad/unknown index
+                         embedding_dim=input_dim)
+            for card in self.metadata_cardinalities
+        ])
+        
+        self.n_meta_tokens = len(self.metadata_cardinalities)
+
+        self.sample_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sample_attention = nn.TransformerEncoder(self.sample_encoder, num_layers)
+
+        self.norm = nn.LayerNorm(input_dim)
+        self.count_out = nn.Linear(input_dim, 1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self._count_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+        if self.grl:
+            self.grl_layer = GradientReversalLayer()
+            self.subject_head = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim // 2), nn.ReLU(),
+                nn.Dropout(dropout), nn.Linear(hidden_dim // 2, unique_donors_train))
+
+        self.output_head = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2), nn.GELU(),
+            nn.Dropout(0.1), nn.Linear(input_dim // 2, 1, bias=True))
+
+        if clr:
+            self.abundance_proj = nn.Sequential(
+                nn.Linear(1, input_dim), nn.LayerNorm(input_dim), nn.GELU())
+        self.norm = nn.LayerNorm(input_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        self.output_head.apply(init_weights)
+        self.count_out.apply(init_weights)
+        for emb in self.metadata_embeddings:
+            init_weights(emb)
+        nn.init.normal_(self.query_vector, mean=0.0, std=0.02)
+        if self.pe:
+            nn.init.normal_(self.pos_embedding.position_embeddings.weight, mean=0.0, std=0.02)
+
+    def forward(self, input_embeddings, abundances, masks,
+                features=None, donor_ids=None):
+        """
+        features: LongTensor [B, n_meta] of category indices, or None.
+                  Column j musTruet have values in [0, metadata_cardinalities[j]-1].
+        """
+        B = input_embeddings.shape[0]
+        # Per-vector norms, averaged across non-padded tokens
+        # mask_flat = masks.view(-1).bool()
+        # flat_emb = input_embeddings.view(-1, input_embeddings.size(-1))
+        # non_padded = flat_emb[mask_flat]
+        # per_vec_norms = non_padded.norm(dim=-1)
+        # print("mean per-vector norm:", per_vec_norms.mean().item())
+        # # print("std per-vector norm:", per_vec_norms.std().item())
+        # print("Input Embeddings Shape:", input_embeddings.shape)
+        # # input embeddings stats
+
+        # # min
+        # print("Input Embeddings Min:", input_embeddings[0,0,:].min())
+        # # max
+        # print("Input Embeddings Max:", input_embeddings[0,0,:].max())
+        # # mean
+        # print("Input Embeddings Mean:", input_embeddings[0,0,:].mean())
+        # # std  
+        # print("Input Embeddings Std:", input_embeddings[0,0,:].std())
+        asv_embeddings = self.scale_embeddings(input_embeddings)
+
+        # --- Abundance fusion ---
+        if self.clr:
+            weighted = asv_embeddings + abundances
+        elif self.pe:
+            weighted = asv_embeddings + self.pos_embedding(asv_embeddings) * abundances
+        else:
+            weighted = asv_embeddings * abundances + asv_embeddings
+
+        # # --- Training-time noise / mask dropout ---
+        # if self.training:
+        #     abundances = abundances + torch.randn_like(abundances) * 0.01
+        #     drop = torch.rand_like(masks.float()) < 0.1
+        #     new_masks = masks.bool() & ~drop.bool()
+        #     empty = new_masks.sum(dim=1) == 0          # samples that lost every ASV
+        #     new_masks[empty] = masks.bool()[empty]     # revert just those rows
+        #     masks = new_masks
+            #masks = masks.bool() & ~drop.bool()
+
+        # if self.training:
+        #     p, min_keep = 0.10, 4
+        #     valid = masks.bool()                                  # [B, L]
+        #     drop  = (torch.rand_like(masks.float()) < p) & valid  # only drop real ASVs
+        #     kept  = valid & ~drop
+
+        #     floor   = torch.minimum(torch.full_like(valid.sum(1), min_keep), valid.sum(1))
+        #     too_few = kept.sum(1) < floor                         # rows that dropped below floor
+        #     kept[too_few] = valid[too_few]                        # revert just those rows
+        #     masks = kept
+
+
+        asv_pad_mask = ~masks.bool()
+        asv_refined = self.sequence_attention(
+            weighted, src_key_padding_mask=asv_pad_mask)
+
+        # Count prediction from ASV positions (skip CLS at index 0)
+        count_pred = self.count_out(asv_refined[:, :, :])
+
+        asv_refined = asv_embeddings + asv_refined * F.softplus(self._count_alpha)
+
+        # --- Dynamic metadata tokens ---
+        if features is not None and self.n_meta_tokens > 0:
+            assert features.shape[1] == self.n_meta_tokens, (
+                f"Expected {self.n_meta_tokens} metadata columns, "
+                f"got {features.shape[1]}")
+            meta_tokens = []
+            for j, emb in enumerate(self.metadata_embeddings):
+                col = features[:, j].long()                   # [B]
+                meta_tokens.append(emb(col).unsqueeze(1))     # [B, 1, D]
+
+            meta_block = torch.cat(meta_tokens, dim=1)         # [B, n_meta, D]
+
+            asv_refined = torch.cat([ meta_block, asv_refined], dim=1)
+
+            meta_mask = torch.ones(B, self.n_meta_tokens,
+                                    device=masks.device, dtype=masks.dtype)
+            masks = torch.cat([ meta_mask, masks], dim=1)
+
+
+       
+        # --- Prepend CLS query token ---
+        cls_mask = torch.ones(B, 1, device=masks.device, dtype=masks.dtype)
+        masks = torch.cat([cls_mask, masks.bool().long() if masks.dtype != torch.bool else masks], dim=1) \
+                if False else torch.cat([cls_mask, masks], dim=1)
+        asv_refined = torch.cat(
+            [self.query_vector.expand(B, -1, -1), asv_refined], dim=1)
+        
+
+
+
+        # --- Sample-level attention ---
+        full_pad_mask = ~masks.bool()
+        target_encoded = self.sample_attention(
+            asv_refined, src_key_padding_mask=full_pad_mask)
+
+
+        # weigthed by abundance again?? 
+
+        summary = target_encoded[:,0,:]
+        summary_token = self.norm(summary)
+        #self.attn_pooling(target_encoded, masks)
+        #tokens = target_encoded[:, self.n_meta_tokens + 1:, :]            # drop the query/CLS slot -> [B, L, D]
+        #ab     = abundances.sum(-1)        # [B, L]; use .squeeze(-1) if C == 1
+        #valid  = masks[:, self.n_meta_tokens + 1:].float()                # [B, L], 1 = real ASV
+        # meta content 
+        #meta_summary = target_encoded[:, 1:self.n_meta_tokens, :].mean(dim=1) if self.n_meta_tokens > 0 else None
+
+
+
+        #summary, attn_w = self.pool(tokens, ab, valid)
+
+        #if meta_summary is not None:
+        #    summary = summary + meta_summary
+
+
+        if self.grl:
+            subj_pred = self.subject_head(self.grl_layer(summary))
+            return self.output_head(summary), count_pred, None, None, subj_pred
+
+        return self.output_head(summary_token), count_pred, None, None, None
+
+
+class BasicRegressor2(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=1024, num_heads=4,
+                 num_layers=2, dropout=0.2, pe=False,
+                 metadata_cardinalities=None,   # e.g. [2, 6] -> env(2), bimonth(6)
+                 grl=False, clr=False, unique_donors_train=106):
+        super().__init__()
+        self.pe = pe
+        self.clr = clr
+        self.grl = grl
+        self.input_dim = input_dim
+
+        self.scale_embeddings = nn.Sequential(
+            nn.Linear(768, input_dim),
+         nn.LayerNorm(input_dim),
+        )
+        self.query_vector = nn.Parameter(torch.randn(1, 1, input_dim) / np.sqrt(input_dim))
+
+        if self.pe:
+            self.pos_embedding = LearnablePositionalEmbedding(input_dim, max_len=5000)
+
+        self.sequence_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sequence_attention = nn.TransformerEncoder(self.sequence_encoder, num_layers)
+
+        self.metadata_cardinalities = metadata_cardinalities or []
+        self.metadata_embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=card + 1,   # +1 for an optional pad/unknown index
+                         embedding_dim=input_dim)
+            for card in self.metadata_cardinalities
+        ])
+        
+        self.n_meta_tokens = len(self.metadata_cardinalities)
+
+        self.sample_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sample_attention = nn.TransformerEncoder(self.sample_encoder, num_layers)
+
+        self.norm = nn.LayerNorm(input_dim)
+        self.count_out = nn.Linear(input_dim, 1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self._count_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+        if self.grl:
+            self.grl_layer = GradientReversalLayer()
+            self.subject_head = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim // 2), nn.ReLU(),
+                nn.Dropout(dropout), nn.Linear(hidden_dim // 2, unique_donors_train))
+
+        self.output_head = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2), nn.GELU(),
+            nn.Dropout(0.1), nn.Linear(input_dim // 2, 1, bias=True))
+
+        if clr:
+            self.abundance_proj = nn.Sequential(
+                nn.Linear(1, input_dim), nn.LayerNorm(input_dim), nn.GELU())
+        self.norm = nn.LayerNorm(input_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        self.output_head.apply(init_weights)
+        self.count_out.apply(init_weights)
+        for emb in self.metadata_embeddings:
+            init_weights(emb)
+        nn.init.normal_(self.query_vector, mean=0.0, std=0.02)
+        if self.pe:
+            nn.init.normal_(self.pos_embedding.position_embeddings.weight, mean=0.0, std=0.02)
+
+    def forward(self, input_embeddings, abundances, masks,
+                features=None, donor_ids=None):
+        """
+        features: LongTensor [B, n_meta] of category indices, or None.
+                  Column j musTruet have values in [0, metadata_cardinalities[j]-1].
+        """
+        B = input_embeddings.shape[0]
+
+
+        asv_embeddings = self.scale_embeddings(input_embeddings)
+
+
+        if features is not None and self.n_meta_tokens > 0:
+            assert features.shape[1] == self.n_meta_tokens, (
+                f"Expected {self.n_meta_tokens} metadata columns, got {features.shape[1]}")
+            meta_vec = 0
+            for j, emb in enumerate(self.metadata_embeddings):
+                meta_vec = meta_vec + emb(features[:, j].long())   # [B, D] each, summed
+            gate = torch.sigmoid(meta_vec)                         # [B, D] in (0, 1)
+            asv_embeddings = asv_embeddings * gate.unsqueeze(1)    # [B, L, D] FiLM gate
+
+        if self.clr:
+            weighted = asv_embeddings + abundances
+        elif self.pe:
+            weighted = asv_embeddings + self.pos_embedding(asv_embeddings) * abundances
+        else:
+            weighted = asv_embeddings * abundances + asv_embeddings
+
+        # # --- Training-time noise / mask dropout ---
+        # if self.training:
+        #     abundances = abundances + torch.randn_like(abundances) * 0.01
+        #     drop = torch.rand_like(masks.float()) < 0.1
+        #     new_masks = masks.bool() & ~drop.bool()
+        #     empty = new_masks.sum(dim=1) == 0          # samples that lost every ASV
+        #     new_masks[empty] = masks.bool()[empty]     # revert just those rows
+        #     masks = new_masks
+            #masks = masks.bool() & ~drop.bool()
+
+        # if self.training:
+        #     p, min_keep = 0.10, 4
+        #     valid = masks.bool()                                  # [B, L]
+        #     drop  = (torch.rand_like(masks.float()) < p) & valid  # only drop real ASVs
+        #     kept  = valid & ~drop
+
+        #     floor   = torch.minimum(torch.full_like(valid.sum(1), min_keep), valid.sum(1))
+        #     too_few = kept.sum(1) < floor                         # rows that dropped below floor
+        #     kept[too_few] = valid[too_few]                        # revert just those rows
+        #     masks = kept
+
+
+        asv_pad_mask = ~masks.bool()
+        asv_refined = self.sequence_attention(
+            weighted, src_key_padding_mask=asv_pad_mask)
+
+        # Count prediction from ASV positions (skip CLS at index 0)
+        count_pred = self.count_out(asv_refined[:, :, :])
+
+
+
+
+       
+        # --- Prepend CLS query token ---
+        cls_mask = torch.ones(B, 1, device=masks.device, dtype=masks.dtype)
+        masks = torch.cat([cls_mask, masks.bool().long() if masks.dtype != torch.bool else masks], dim=1) \
+                if False else torch.cat([cls_mask, masks], dim=1)
+        asv_refined = torch.cat(
+            [self.query_vector.expand(B, -1, -1), asv_refined], dim=1)
+        
+
+
+
+        # --- Sample-level attention ---
+        full_pad_mask = ~masks.bool()
+        target_encoded = self.sample_attention(
+            asv_refined, src_key_padding_mask=full_pad_mask)
+
+
+        # weigthed by abundance again?? 
+
+        summary = target_encoded[:,0,:]
+        summary_token = self.norm(summary)
+        #self.attn_pooling(target_encoded, masks)
+        #tokens = target_encoded[:, self.n_meta_tokens + 1:, :]            # drop the query/CLS slot -> [B, L, D]
+        #ab     = abundances.sum(-1)        # [B, L]; use .squeeze(-1) if C == 1
+        #valid  = masks[:, self.n_meta_tokens + 1:].float()                # [B, L], 1 = real ASV
+        # meta content 
+        #meta_summary = target_encoded[:, 1:self.n_meta_tokens, :].mean(dim=1) if self.n_meta_tokens > 0 else None
+
+
+
+        #summary, attn_w = self.pool(tokens, ab, valid)
+
+        #if meta_summary is not None:
+        #    summary = summary + meta_summary
+
+
+        if self.grl:
+            subj_pred = self.subject_head(self.grl_layer(summary))
+            return self.output_head(summary), count_pred, None, None, subj_pred
+
+        return self.output_head(summary_token), count_pred, None, None, None
+    
+
+
+class BasicRegressor3(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=1024, num_heads=4,
+                 num_layers=2, dropout=0.2, pe=False,
+                 metadata_cardinalities=None,   # e.g. [2, 6] -> env(2), bimonth(6)
+                 grl=False, clr=False, unique_donors_train=106):
+        super().__init__()
+        self.pe = pe
+        self.clr = clr
+        self.grl = grl
+        self.input_dim = input_dim
+
+        self.scale_embeddings = nn.Sequential(
+            nn.Linear(768, input_dim),
+         nn.LayerNorm(input_dim),
+        )
+        self.query_vector = nn.Parameter(torch.randn(1, 1, input_dim) / np.sqrt(input_dim))
+
+        if self.pe:
+            self.pos_embedding = LearnablePositionalEmbedding(input_dim, max_len=5000)
+
+        self.sequence_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sequence_attention = nn.TransformerEncoder(self.sequence_encoder, num_layers)
+
+        self.metadata_cardinalities = metadata_cardinalities or []
+        self.metadata_embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=card + 1,   # +1 for an optional pad/unknown index
+                         embedding_dim=input_dim)
+            for card in self.metadata_cardinalities
+        ])
+        
+        self.n_meta_tokens = len(self.metadata_cardinalities)
+
+        self.sample_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sample_attention = nn.TransformerEncoder(self.sample_encoder, num_layers)
+
+        self.norm = nn.LayerNorm(input_dim)
+        self.count_out = nn.Linear(input_dim, 1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self._count_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+        if self.grl:
+            self.grl_layer = GradientReversalLayer()
+            self.subject_head = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim // 2), nn.ReLU(),
+                nn.Dropout(dropout), nn.Linear(hidden_dim // 2, unique_donors_train))
+
+        self.output_head = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2), nn.GELU(),
+            nn.Dropout(0.1), nn.Linear(input_dim // 2, 1, bias=True))
+
+        if clr:
+            self.abundance_proj = nn.Sequential(
+                nn.Linear(1, input_dim), nn.LayerNorm(input_dim), nn.GELU())
+        self.norm = nn.LayerNorm(input_dim)
+        self.film = nn.Linear(input_dim, 2 * input_dim) 
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        self.output_head.apply(init_weights)
+        self.count_out.apply(init_weights)
+        for emb in self.metadata_embeddings:
+            init_weights(emb)
+        nn.init.normal_(self.query_vector, mean=0.0, std=0.02)
+        if self.pe:
+            nn.init.normal_(self.pos_embedding.position_embeddings.weight, mean=0.0, std=0.02)
+
+    def forward(self, input_embeddings, abundances, masks,
+                features=None, donor_ids=None):
+        """
+        features: LongTensor [B, n_meta] of category indices, or None.
+                  Column j musTruet have values in [0, metadata_cardinalities[j]-1].
+        """
+        B = input_embeddings.shape[0]
+
+
+        asv_embeddings = self.scale_embeddings(input_embeddings)
+
+
+        if features is not None and self.n_meta_tokens > 0:
+            assert features.shape[1] == self.n_meta_tokens, (
+                f"Expected {self.n_meta_tokens} metadata columns, got {features.shape[1]}")
+            meta_vec = 0
+            for j, emb in enumerate(self.metadata_embeddings):
+                meta_vec = meta_vec + emb(features[:, j].long())   # [B, D] each, summed
+            
+            gamma, beta = self.film(meta_vec).chunk(2, dim=-1)         # each [B, D]
+            asv_embeddings = (1 + gamma).unsqueeze(1) * asv_embeddings + beta.unsqueeze(1)
+
+        if self.training:
+
+            abundances += torch.randn_like(abundances) * 0.01
+            dropout_mask = torch.rand_like(masks.float()) < 0.05
+            new_masks = masks.bool() & ~dropout_mask.bool()
+            empty = new_masks.sum(dim=1) == 0          
+            new_masks[empty] = masks.bool()[empty]     
+            masks = new_masks
+
+
+        if self.clr:
+            weighted = asv_embeddings + abundances
+        elif self.pe:
+            weighted = asv_embeddings + self.pos_embedding(asv_embeddings) * abundances
+        else:
+            weighted = asv_embeddings * abundances + asv_embeddings
+
+
+
+
+        asv_pad_mask = ~masks.bool()
+        asv_refined = self.sequence_attention(
+            weighted, src_key_padding_mask=asv_pad_mask)
+
+        count_pred = self.count_out(asv_refined[:, :, :])
+
+        # --- Prepend CLS query token ---
+        cls_mask = torch.ones(B, 1, device=masks.device, dtype=masks.dtype)
+        masks = torch.cat([cls_mask, masks.bool().long() if masks.dtype != torch.bool else masks], dim=1) \
+                if False else torch.cat([cls_mask, masks], dim=1)
+        asv_refined = torch.cat(
+            [self.query_vector.expand(B, -1, -1), asv_refined], dim=1)
+        
+
+
+
+        # --- Sample-level attention ---
+        full_pad_mask = ~masks.bool()
+        target_encoded = self.sample_attention(
+            asv_refined, src_key_padding_mask=full_pad_mask)
+
+
+        # weigthed by abundance again?? 
+
+        summary = target_encoded[:,0,:]
+        summary_token = self.norm(summary)
+
+        if self.grl:
+            subj_pred = self.subject_head(self.grl_layer(summary))
+            return self.output_head(summary), count_pred, None, None, subj_pred
+
+        return self.output_head(summary_token), count_pred, None, None, None
+
+
+
+class BasicRegressorAttn(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=1024, num_heads=4,
+                 num_layers=2, dropout=0.2, pe=False,
+                 metadata_cardinalities=None,   # e.g. [2, 6] -> env(2), bimonth(6)
+                 grl=False, clr=False, unique_donors_train=106):
+        super().__init__()
+        self.pe = pe
+        self.clr = clr
+        self.grl = grl
+        self.input_dim = input_dim
+
+        self.scale_embeddings = nn.Sequential(
+            nn.Linear(768, input_dim),
+         nn.LayerNorm(input_dim),
+        )
+        self.query_vector = nn.Parameter(torch.randn(1, 1, input_dim) / np.sqrt(input_dim))
+
+        if self.pe:
+            self.pos_embedding = LearnablePositionalEmbedding(input_dim, max_len=5000)
+
+        self.sequence_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sequence_attention = nn.TransformerEncoder(self.sequence_encoder, num_layers)
+
+        self.metadata_cardinalities = metadata_cardinalities or []
+        self.metadata_embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=card + 1,   # +1 for an optional pad/unknown index
+                         embedding_dim=input_dim)
+            for card in self.metadata_cardinalities
+        ])
+        
+        self.n_meta_tokens = len(self.metadata_cardinalities)
+
+        self.sample_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sample_attention = nn.TransformerEncoder(self.sample_encoder, num_layers)
+
+        self.norm = nn.LayerNorm(input_dim)
+        self.count_out = nn.Linear(input_dim, 1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self._count_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+        if self.grl:
+            self.grl_layer = GradientReversalLayer()
+            self.subject_head = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim // 2), nn.ReLU(),
+                nn.Dropout(dropout), nn.Linear(hidden_dim // 2, unique_donors_train))
+
+        self.output_head = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2), nn.GELU(),
+            nn.Dropout(0.1), nn.Linear(input_dim // 2, 1, bias=True))
+
+        if clr:
+            self.abundance_proj = nn.Sequential(
+                nn.Linear(1, input_dim), nn.LayerNorm(input_dim), nn.GELU())
+        self.norm = nn.LayerNorm(input_dim)
+        self.film = nn.Linear(input_dim, 2 * input_dim) 
+        self.attn_pooling = AttentionPool(input_dim)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        self.output_head.apply(init_weights)
+        self.count_out.apply(init_weights)
+        for emb in self.metadata_embeddings:
+            init_weights(emb)
+        nn.init.normal_(self.query_vector, mean=0.0, std=0.02)
+        if self.pe:
+            nn.init.normal_(self.pos_embedding.position_embeddings.weight, mean=0.0, std=0.02)
+
+    def forward(self, input_embeddings, abundances, masks,
+                features=None, donor_ids=None):
+        """
+        features: LongTensor [B, n_meta] of category indices, or None.
+                  Column j musTruet have values in [0, metadata_cardinalities[j]-1].
+        """
+        B = input_embeddings.shape[0]
+
+
+        asv_embeddings = self.scale_embeddings(input_embeddings)
+
+
+        if features is not None and self.n_meta_tokens > 0:
+            assert features.shape[1] == self.n_meta_tokens, (
+                f"Expected {self.n_meta_tokens} metadata columns, got {features.shape[1]}")
+            meta_vec = 0
+            for j, emb in enumerate(self.metadata_embeddings):
+                meta_vec = meta_vec + emb(features[:, j].long())   # [B, D] each, summed
+            
+            gamma, beta = self.film(meta_vec).chunk(2, dim=-1)         # each [B, D]
+            asv_embeddings = (1 + gamma).unsqueeze(1) * asv_embeddings + beta.unsqueeze(1)
+
+        if self.training:
+
+            abundances += torch.randn_like(abundances) * 0.01
+            dropout_mask = torch.rand_like(masks.float()) < 0.05
+            new_masks = masks.bool() & ~dropout_mask.bool()
+            empty = new_masks.sum(dim=1) == 0          
+            new_masks[empty] = masks.bool()[empty]     
+            masks = new_masks
+
+
+        if self.clr:
+            weighted = asv_embeddings + abundances
+        elif self.pe:
+            weighted = asv_embeddings + self.pos_embedding(asv_embeddings) * abundances
+        else:
+            weighted = asv_embeddings * abundances + asv_embeddings
+
+
+
+
+        asv_pad_mask = ~masks.bool()
+        asv_refined = self.sequence_attention(
+            weighted, src_key_padding_mask=asv_pad_mask)
+
+        count_pred = self.count_out(asv_refined[:, :, :])
+
+        # --- Prepend CLS query token ---
+        cls_mask = torch.ones(B, 1, device=masks.device, dtype=masks.dtype)
+        masks = torch.cat([cls_mask, masks.bool().long() if masks.dtype != torch.bool else masks], dim=1) \
+                if False else torch.cat([cls_mask, masks], dim=1)
+        asv_refined = torch.cat(
+            [self.query_vector.expand(B, -1, -1), asv_refined], dim=1)
+        
+
+
+
+        # --- Sample-level attention ---
+        full_pad_mask = ~masks.bool()
+        target_encoded = self.sample_attention(
+            asv_refined, src_key_padding_mask=full_pad_mask)
+
+
+        # weigthed by abundance again?? 
+        summary = self.attn_pooling(target_encoded, masks)
+        #summary = target_encoded[:,0,:]
+        summary_token = self.norm(summary)
+        #self.attn_pooling(target_encoded, masks)
+        #tokens = target_encoded[:, self.n_meta_tokens + 1:, :]            # drop the query/CLS slot -> [B, L, D]
+        #ab     = abundances.sum(-1)        # [B, L]; use .squeeze(-1) if C == 1
+        #valid  = masks[:, self.n_meta_tokens + 1:].float()                # [B, L], 1 = real ASV
+        # meta content 
+        #meta_summary = target_encoded[:, 1:self.n_meta_tokens, :].mean(dim=1) if self.n_meta_tokens > 0 else None
+
+
+
+        #summary, attn_w = self.pool(tokens, ab, valid)
+
+        #if meta_summary is not None:
+        #    summary = summary + meta_summary
+
+
+        if self.grl:
+            subj_pred = self.subject_head(self.grl_layer(summary))
+            return self.output_head(summary), count_pred, None, None, subj_pred
+
+        return self.output_head(summary), count_pred, None, None, None
+
+
+
+class BasicRegressor4(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=1024, num_heads=4,
+                 num_layers=2, dropout=0.2, pe=False,
+                 metadata_cardinalities=None,   # e.g. [2, 6] -> env(2), bimonth(6)
+                 grl=False, clr=False, unique_donors_train=106):
+        super().__init__()
+        self.pe = pe
+        self.clr = clr
+        self.grl = grl
+        self.input_dim = input_dim
+
+        self.scale_embeddings = nn.Sequential(
+            nn.Linear(768, input_dim),
+         nn.LayerNorm(input_dim),
+        )
+        self.query_vector = nn.Parameter(torch.randn(1, 1, input_dim) / np.sqrt(input_dim))
+
+        if self.pe:
+            self.pos_embedding = LearnablePositionalEmbedding(input_dim, max_len=5000)
+
+        self.sequence_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sequence_attention = nn.TransformerEncoder(self.sequence_encoder, num_layers)
+
+        self.metadata_cardinalities = metadata_cardinalities or []
+        self.metadata_embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=card + 1,   # +1 for an optional pad/unknown index
+                         embedding_dim=input_dim)
+            for card in self.metadata_cardinalities
+        ])
+        
+        self.n_meta_tokens = len(self.metadata_cardinalities)
+
+        self.sample_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sample_attention = nn.TransformerEncoder(self.sample_encoder, num_layers)
+
+        self.norm = nn.LayerNorm(input_dim)
+        self.count_out = nn.Linear(input_dim, 1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self._count_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+        if self.grl:
+            self.grl_layer = GradientReversalLayer()
+            self.subject_head = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim // 2), nn.ReLU(),
+                nn.Dropout(dropout), nn.Linear(hidden_dim // 2, unique_donors_train))
+
+        self.output_head = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2), nn.GELU(),
+            nn.Dropout(0.1), nn.Linear(input_dim // 2, 1, bias=True))
+
+        if clr:
+            self.abundance_proj = nn.Sequential(
+                nn.Linear(1, input_dim), nn.LayerNorm(input_dim), nn.GELU())
+        self.norm = nn.LayerNorm(input_dim)
+        self.film = nn.Linear(input_dim, 2 * input_dim) 
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        self.output_head.apply(init_weights)
+        self.count_out.apply(init_weights)
+        for emb in self.metadata_embeddings:
+            init_weights(emb)
+        nn.init.normal_(self.query_vector, mean=0.0, std=0.02)
+        if self.pe:
+            nn.init.normal_(self.pos_embedding.position_embeddings.weight, mean=0.0, std=0.02)
+
+    def forward(self, input_embeddings, abundances, masks,
+                features=None, donor_ids=None):
+        """
+        features: LongTensor [B, n_meta] of category indices, or None.
+                  Column j musTruet have values in [0, metadata_cardinalities[j]-1].
+        """
+        B = input_embeddings.shape[0]
+
+
+        asv_embeddings = self.scale_embeddings(input_embeddings)
+
+
+        if features is not None and self.n_meta_tokens > 0:
+            assert features.shape[1] == self.n_meta_tokens, (
+                f"Expected {self.n_meta_tokens} metadata columns, got {features.shape[1]}")
+            meta_vec = 0
+            for j, emb in enumerate(self.metadata_embeddings):
+                meta_vec = meta_vec + emb(features[:, j].long())   # [B, D] each, summed
+            
+            gamma, beta = self.film(meta_vec).chunk(2, dim=-1)         # each [B, D]
+            asv_embeddings = (1 + gamma).unsqueeze(1) * asv_embeddings + beta.unsqueeze(1)
+
+        
+        batch_size = input_embeddings.shape[0]
+        query_token = self.query_vector.expand(B, -1, -1)  # shape: [B, 1, D]
+
+        asv_embeddings = torch.cat([query_token, asv_embeddings], dim=1)  # [B, 1 + L, D]
+
+        abundances = abundances.transpose(1, 2)  # [B, C, L]
+        abundances = F.pad(abundances, pad=(1, 0), mode='constant', value=1)  # only pad left of L
+
+        abundances = abundances.transpose(1, 2)  # [B, L+2, C]
+        
+        cls_mask = torch.ones(batch_size, 1, device=masks.device, dtype=masks.dtype)
+        masks = torch.cat([cls_mask, masks], dim=1)
+        attention_mask = ~masks.bool()  
+        
+
+            
+        if self.clr:
+            weighted = asv_embeddings + abundances
+        elif self.pe:
+            weighted = asv_embeddings + self.pos_embedding(asv_embeddings) * abundances
+        else:
+            weighted = asv_embeddings * abundances + asv_embeddings
+
+
+
+
+        asv_refined = self.sequence_attention(
+            weighted, src_key_padding_mask=attention_mask)
+
+        # Count prediction from ASV positions (skip CLS at index 0)
+        count_pred = self.count_out(asv_refined[:, 1:, :])
+
+        # --- Sample-level attention ---
+        full_pad_mask = ~masks.bool()
+        target_encoded = self.sample_attention(
+            asv_refined, src_key_padding_mask=full_pad_mask)
+
+
+        # weigthed by abundance again?? 
+
+        summary = target_encoded[:,0,:]
+        summary_token = self.norm(summary)
+
+        if self.grl:
+            subj_pred = self.subject_head(self.grl_layer(summary))
+            return self.output_head(summary), count_pred, None, None, subj_pred
+
+        return self.output_head(summary_token), count_pred, None, None, None
+
+   
+
+class BasicRegressor5(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=1024, num_heads=4,
+                 num_layers=2, dropout=0.2, pe=False,
+                 metadata_cardinalities=None,   # e.g. [2, 6] -> env(2), bimonth(6)
+                 grl=False, clr=False, unique_donors_train=106):
+        super().__init__()
+        self.pe = pe
+        self.clr = clr
+        self.grl = grl
+        self.input_dim = input_dim
+
+        if self.grl:
+            print("Using Gradient Reversal Layer with unique_donors_train =", unique_donors_train)
+
+        self.scale_embeddings = nn.Sequential(
+            nn.Linear(768, input_dim),
+         nn.LayerNorm(input_dim),
+        )
+        self.query_vector = nn.Parameter(torch.randn(1, 1, input_dim) / np.sqrt(input_dim))
+
+        if self.pe:
+            self.pos_embedding = LearnablePositionalEmbedding(input_dim, max_len=5000)
+
+        self.sequence_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sequence_attention = nn.TransformerEncoder(self.sequence_encoder, num_layers)
+
+        self.metadata_cardinalities = metadata_cardinalities or []
+        self.metadata_embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=card + 1,   # +1 for an optional pad/unknown index
+                         embedding_dim=input_dim)
+            for card in self.metadata_cardinalities
+        ])
+        
+        self.n_meta_tokens = len(self.metadata_cardinalities)
+
+        self.sample_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sample_attention = nn.TransformerEncoder(self.sample_encoder, num_layers)
+
+        self.norm = nn.LayerNorm(input_dim)
+        self.count_out = nn.Linear(input_dim, 1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self._count_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+        if self.grl:
+            self.grl_layer = GradientReversalLayer()
+            self.subject_head = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim // 2), nn.ReLU(),
+                nn.Dropout(dropout), nn.Linear(hidden_dim // 2, unique_donors_train))
+
+        self.output_head = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2), nn.GELU(),
+            nn.Dropout(0.1), nn.Linear(input_dim // 2, 1, bias=True))
+
+        if clr:
+            self.abundance_proj = nn.Sequential(
+                nn.Linear(1, input_dim), nn.LayerNorm(input_dim), nn.GELU())
+        self.norm = nn.LayerNorm(input_dim)
+        self.film = nn.Linear(input_dim, 2 * input_dim) 
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        self.output_head.apply(init_weights)
+        self.count_out.apply(init_weights)
+        for emb in self.metadata_embeddings:
+            init_weights(emb)
+        nn.init.normal_(self.query_vector, mean=0.0, std=0.02)
+        if self.pe:
+            nn.init.normal_(self.pos_embedding.position_embeddings.weight, mean=0.0, std=0.02)
+
+    def forward(self, input_embeddings, abundances, masks,
+                features=None, donor_ids=None):
+        """
+        features: LongTensor [B, n_meta] of category indices, or None.
+                  Column j musTruet have values in [0, metadata_cardinalities[j]-1].
+        """
+        B = input_embeddings.shape[0]
+
+
+        asv_embeddings = self.scale_embeddings(input_embeddings)
+
+
+        if features is not None and self.n_meta_tokens > 0:
+            assert features.shape[1] == self.n_meta_tokens, (
+                f"Expected {self.n_meta_tokens} metadata columns, got {features.shape[1]}")
+            meta_vec = 0
+            for j, emb in enumerate(self.metadata_embeddings):
+                meta_vec = meta_vec + emb(features[:, j].long())   # [B, D] each, summed
+            
+            gamma, beta = self.film(meta_vec).chunk(2, dim=-1)         # each [B, D]
+            asv_embeddings = (1 + gamma).unsqueeze(1) * asv_embeddings + beta.unsqueeze(1)
+            
+        if self.clr:
+            weighted = asv_embeddings + abundances
+        elif self.pe:
+            weighted = asv_embeddings + self.pos_embedding(asv_embeddings) * abundances
+        else:
+            weighted = asv_embeddings * abundances + asv_embeddings
+
+
+
+
+        asv_pad_mask = ~masks.bool()
+        asv_refined = self.sequence_attention(
+            weighted, src_key_padding_mask=asv_pad_mask)
+
+        # Count prediction from ASV positions (skip CLS at index 0)
+        count_pred = self.count_out(asv_refined[:, :, :])
+
+
+
+
+       
+        # --- Prepend CLS query token ---
+        cls_mask = torch.ones(B, 1, device=masks.device, dtype=masks.dtype)
+        masks = torch.cat([cls_mask, masks.bool().long() if masks.dtype != torch.bool else masks], dim=1) \
+                if False else torch.cat([cls_mask, masks], dim=1)
+        asv_refined = torch.cat(
+            [self.query_vector.expand(B, -1, -1), asv_refined], dim=1)
+        
+
+
+
+        # --- Sample-level attention ---
+        full_pad_mask = ~masks.bool()
+        target_encoded = self.sample_attention(
+            asv_refined, src_key_padding_mask=full_pad_mask)
+
+
+        # weigthed by abundance again?? 
+
+        summary = target_encoded[:,0,:]
+        summary_token = self.norm(summary)
+
+
+
+        if self.grl:
+            subj_pred = self.subject_head(self.grl_layer(summary))
+            return self.output_head(summary), count_pred, None, None, subj_pred
+
+        return self.output_head(summary_token), count_pred, None, None, None
+
+
+class BasicRegressor6(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=1024, num_heads=4,
+                 num_layers=2, dropout=0.2, pe=False,
+                 metadata_cardinalities=None,   # e.g. [2, 6] -> env(2), bimonth(6)
+                 grl=False, clr=False, unique_donors_train=106):
+        super().__init__()
+        self.pe = pe
+        self.clr = clr
+        self.grl = grl
+        self.input_dim = input_dim
+
+        self.scale_embeddings = nn.Sequential(
+            nn.Linear(768, input_dim),
+         nn.LayerNorm(input_dim),
+        )
+        self.query_vector = nn.Parameter(torch.randn(1, 1, input_dim) / np.sqrt(input_dim))
+
+        if self.pe:
+            self.pos_embedding = LearnablePositionalEmbedding(input_dim, max_len=5000)
+
+        self.sequence_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sequence_attention = nn.TransformerEncoder(self.sequence_encoder, num_layers)
+
+        self.metadata_cardinalities = metadata_cardinalities or []
+        self.metadata_embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=card + 1,   # +1 for an optional pad/unknown index
+                         embedding_dim=input_dim)
+            for card in self.metadata_cardinalities
+        ])
+        
+        self.n_meta_tokens = len(self.metadata_cardinalities)
+
+        self.sample_encoder = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
+            dropout=dropout, activation=gelu, batch_first=True)
+        self.sample_attention = nn.TransformerEncoder(self.sample_encoder, num_layers)
+
+        self.norm = nn.LayerNorm(input_dim)
+        self.count_out = nn.Linear(input_dim, 1, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self._count_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+        if self.grl:
+            self.grl_layer = GradientReversalLayer()
+            self.subject_head = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim // 2), nn.ReLU(),
+                nn.Dropout(dropout), nn.Linear(hidden_dim // 2, unique_donors_train))
+
+        self.output_head = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2), nn.GELU(),
+            nn.Dropout(0.1), nn.Linear(input_dim // 2, 1, bias=True))
+
+        if clr:
+            self.abundance_proj = nn.Sequential(
+                nn.Linear(1, input_dim), nn.LayerNorm(input_dim), nn.GELU())
+        self.norm = nn.LayerNorm(input_dim)
+        self.film = nn.Linear(input_dim, 2 * input_dim) 
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        self.output_head.apply(init_weights)
+        self.count_out.apply(init_weights)
+        for emb in self.metadata_embeddings:
+            init_weights(emb)
+        nn.init.normal_(self.query_vector, mean=0.0, std=0.02)
+        if self.pe:
+            nn.init.normal_(self.pos_embedding.position_embeddings.weight, mean=0.0, std=0.02)
+
+    def forward(self, input_embeddings, abundances, masks,
+                features=None, donor_ids=None):
+        """
+        features: LongTensor [B, n_meta] of category indices, or None.
+                  Column j musTruet have values in [0, metadata_cardinalities[j]-1].
+        """
+        B = input_embeddings.shape[0]
+
+
+        asv_embeddings = self.scale_embeddings(input_embeddings)
+
+
+        if features is not None and self.n_meta_tokens > 0:
+            assert features.shape[1] == self.n_meta_tokens, (
+                f"Expected {self.n_meta_tokens} metadata columns, got {features.shape[1]}")
+            meta_vec = 0
+            for j, emb in enumerate(self.metadata_embeddings):
+                meta_vec = meta_vec + emb(features[:, j].long())   # [B, D] each, summed
+            
+            gamma, beta = self.film(meta_vec).chunk(2, dim=-1)         # each [B, D]
+            asv_embeddings = (1 + gamma).unsqueeze(1) * asv_embeddings + beta.unsqueeze(1)
+
+
+        if self.training:
+                    # if self.training: 
+            abundances += torch.randn_like(abundances) * 0.01
+            dropout_mask = torch.rand_like(masks.float()) < 0.05
+            new_masks = masks.bool() & ~dropout_mask.bool()
+            empty = new_masks.sum(dim=1) == 0          
+            new_masks[empty] = masks.bool()[empty]     
+            masks = new_masks
+
+
+        
+        batch_size = input_embeddings.shape[0]
+        query_token = self.query_vector.expand(B, -1, -1)  # shape: [B, 1, D]
+
+        asv_embeddings = torch.cat([query_token, asv_embeddings], dim=1)  # [B, 1 + L, D]
+
+        abundances = abundances.transpose(1, 2)  # [B, C, L]
+        abundances = F.pad(abundances, pad=(1, 0), mode='constant', value=1)  # only pad left of L
+
+        abundances = abundances.transpose(1, 2)  # [B, L+2, C]
+        
+        cls_mask = torch.ones(batch_size, 1, device=masks.device, dtype=masks.dtype)
+        masks = torch.cat([cls_mask, masks], dim=1)
+        attention_mask = ~masks.bool()  
+        
+
+            
+        if self.clr:
+            weighted = asv_embeddings + abundances
+        elif self.pe:
+            weighted = asv_embeddings + self.pos_embedding(asv_embeddings) * abundances
+        else:
+            weighted = asv_embeddings * abundances + asv_embeddings
+
+
+
+
+        asv_refined = self.sequence_attention(
+            weighted, src_key_padding_mask=attention_mask)
+
+        # Count prediction from ASV positions (skip CLS at index 0)
+        count_pred = self.count_out(asv_refined[:, 1:, :])
+
+        # --- Sample-level attention ---
+        full_pad_mask = ~masks.bool()
+        target_encoded = self.sample_attention(
+            asv_refined, src_key_padding_mask=full_pad_mask)
+
+
+        # weigthed by abundance again?? 
+
+        summary = target_encoded[:,0,:]
+        summary_token = self.norm(summary)
+
+        if self.grl:
+            subj_pred = self.subject_head(self.grl_layer(summary))
+            return self.output_head(summary), count_pred, None, None, subj_pred
+
+        return self.output_head(summary_token), count_pred, None, None, None
+
 
 
 import torch
@@ -829,7 +2027,6 @@ class AbundanceGating(nn.Module):
         a = abundance.unsqueeze(-1)  # (B, N, 1)
         gate = self.mlp(a)           # (B, N, D)
         return embeddings * gate
-
 
 # -----------------------------
 # Attention Pooling

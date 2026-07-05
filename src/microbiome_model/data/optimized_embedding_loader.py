@@ -294,7 +294,7 @@ class MemoryMappedEmbeddingLoaderNew2:
         # CREATE MMAP IF NEEDED
         # -------------------------
         if not os.path.exists(self.mmap_path):
-            print("🔄 Converting HDF5 → memory-mapped file...")
+            print("Converting HDF5 → memory-mapped file...")
 
             with h5py.File(self.embedding_path, 'r') as f:
                 embeddings = f["embeddings"][:]   # shape (N, D)

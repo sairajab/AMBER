@@ -178,7 +178,7 @@ def compute_and_save_embeddings(
     tokenizer,
     model,
     output_path,
-    batch_size=32,
+    batch_size=128,
     device='cuda',
     max_length=512,
     pooling='cls'  # 'mean' or 'cls'
@@ -359,15 +359,17 @@ class EmbeddingLoader:
     """Memory-efficient embedding loader using H5 files"""
     def __init__(self, embedding_path, embedding_dim=128, preload_all=False):
         self.embedding_path = embedding_path
-        self.file = h5py.File(self.embedding_path, 'r')
         self.embedding_dim = embedding_dim
-        self.cache = {}
-        self.preload_all = preload_all
-        
-        if preload_all:
-            self._preload_embeddings()
-            self.file.close()
-            self.file = None  # Close file handle if all preloaded
+        if embedding_path and os.path.exists(embedding_path):
+            self.file = h5py.File(self.embedding_path, 'r')
+            
+            self.cache = {}
+            self.preload_all = preload_all
+            
+            if preload_all:
+                self._preload_embeddings()
+                self.file.close()
+                self.file = None  # Close file handle if all preloaded
         
     def _preload_embeddings(self):
         """Preload all embeddings into memory for faster access"""

@@ -3,6 +3,7 @@ import torch
 
 from microbiome_model.models.orig import (
     BasicRegressor,
+    AMBERRegressor,
     BasicRegressorwithUnifrac,
 )
 from microbiome_model.models.zoo import (
@@ -10,6 +11,14 @@ from microbiome_model.models.zoo import (
     CLR,
     ClusteredRegressor,
     GeneralizedRegressor,
+    BasicRegressorBest,
+    BasicRegressor1, 
+    BasicRegressor2,
+    BasicRegressor3,
+    BasicRegressor4,
+    BasicRegressor5,
+    BasicRegressor6,
+    BasicRegressorAttn
 )
 
 
@@ -43,6 +52,17 @@ def build_model(cfg: dict, device: str = "cpu"):
             grl =cfg.get("grl", False),
             unique_donors_train=cfg.get("num_donors", 0),
             clr =cfg.get("clr", False),
+            metadata_cardinalities=cfg.get("metadata_cardinalities", None),
+        )
+    elif name == "AMBERRegressor":
+        return AMBERRegressor(
+            input_dim=cfg.get("input_dim", 768),
+            hidden_dim=cfg.get("hidden_dim", 1024),
+            num_heads=cfg.get("num_heads", 4),
+            num_layers=cfg.get("num_layers", 2),
+            dropout=cfg.get("dropout", 0.2),
+            pe=cfg.get("pe", False),
+            metadata_cardinalities=cfg.get("metadata_cardinalities", None),
         )
 
     elif name == "BasicRegressorGRL":
@@ -53,8 +73,84 @@ def build_model(cfg: dict, device: str = "cpu"):
             num_layers=cfg.get("num_layers", 2),
             dropout=cfg.get("dropout", 0.2),
             pe=cfg.get("pe", False),
+            metadata_cardinalities=cfg.get("metadata_cardinalities", None),
         )
 
+    elif name == "BasicRegressor1":
+        return BasicRegressor1(
+            input_dim=cfg.get("input_dim", 768),
+            hidden_dim=cfg.get("hidden_dim", 1024),
+            num_heads=cfg.get("num_heads", 4),
+            num_layers=cfg.get("num_layers", 2),
+            dropout=cfg.get("dropout", 0.2),
+            pe=cfg.get("pe", False),
+            metadata_cardinalities=cfg.get("metadata_cardinalities", None),
+        )
+    
+    elif name == "BasicRegressor2":
+        return BasicRegressor2(
+            input_dim=cfg.get("input_dim", 768),
+            hidden_dim=cfg.get("hidden_dim", 1024),
+            num_heads=cfg.get("num_heads", 4),
+            num_layers=cfg.get("num_layers", 2),
+            dropout=cfg.get("dropout", 0.2),
+            pe=cfg.get("pe", False),
+            metadata_cardinalities=cfg.get("metadata_cardinalities", None),
+        )
+    
+    elif name == "BasicRegressor3":
+        return BasicRegressor3(
+            input_dim=cfg.get("input_dim", 768),
+            hidden_dim=cfg.get("hidden_dim", 1024),
+            num_heads=cfg.get("num_heads", 4),
+            num_layers=cfg.get("num_layers", 2),
+            dropout=cfg.get("dropout", 0.2),
+            pe=cfg.get("pe", False),
+            metadata_cardinalities=cfg.get("metadata_cardinalities", None),
+        )
+
+    elif name == "BasicRegressorAttn":
+        return BasicRegressorAttn(
+            input_dim=cfg.get("input_dim", 768),
+            hidden_dim=cfg.get("hidden_dim", 1024),
+            num_heads=cfg.get("num_heads", 4),
+            num_layers=cfg.get("num_layers", 2),
+            dropout=cfg.get("dropout", 0.2),
+            pe=cfg.get("pe", False),
+            metadata_cardinalities=cfg.get("metadata_cardinalities", None),
+        )
+    elif name == "BasicRegressor4":
+        return BasicRegressor4(
+            input_dim=cfg.get("input_dim", 768),
+            hidden_dim=cfg.get("hidden_dim", 1024),
+            num_heads=cfg.get("num_heads", 4),
+            num_layers=cfg.get("num_layers", 2),
+            dropout=cfg.get("dropout", 0.2),
+            pe=cfg.get("pe", False),
+            metadata_cardinalities=cfg.get("metadata_cardinalities", None),
+        )
+    elif name == "BasicRegressor5":
+        return BasicRegressor5(
+            input_dim=cfg.get("input_dim", 768),
+            hidden_dim=cfg.get("hidden_dim", 1024),
+            num_heads=cfg.get("num_heads", 4),
+            num_layers=cfg.get("num_layers", 2),
+            dropout=cfg.get("dropout", 0.2),
+            pe=cfg.get("pe", False),
+            metadata_cardinalities=cfg.get("metadata_cardinalities", None),
+            grl=True,
+            unique_donors_train=cfg.get("num_donors", 74),
+        )
+    elif name == "BasicRegressor6":
+        return BasicRegressor6(
+            input_dim=cfg.get("input_dim", 768),
+            hidden_dim=cfg.get("hidden_dim", 1024),
+            num_heads=cfg.get("num_heads", 4),
+            num_layers=cfg.get("num_layers", 2),
+            dropout=cfg.get("dropout", 0.2),
+            pe=cfg.get("pe", False),
+            metadata_cardinalities=cfg.get("metadata_cardinalities", None),
+        )
     elif name == "BasicRegressorNew":
         from microbiome_model.training.pre_training_masked import MaskedAbundancePretraining
         base = MaskedAbundancePretraining(input_dim=768)
@@ -109,10 +205,19 @@ def build_model(cfg: dict, device: str = "cpu"):
             num_layers=cfg.get("num_layers", 2),
             dropout=cfg.get("dropout", 0.2),
         )
+    elif name == "BasicRegressorBest":
+        return BasicRegressorBest(
+            input_dim=cfg.get("input_dim", 512),
+            hidden_dim=cfg.get("hidden_dim", 512),
+            num_heads=cfg.get("num_heads", 4),
+            num_layers=cfg.get("num_layers", 2),
+            dropout=cfg.get("dropout", 0.2),
+            pe=cfg.get("pe", False),
+            )
 
     else:
         raise ValueError(
             f"Unknown model_name: {name!r}. "
-            "Supported: BasicRegressor, BasicRegressorGRL, BasicRegressorNew, "
+            "Supported: BasicRegressor, BasicRegressorGRL, BasicRegressorNew, BasicRegressor1, "
             "GeneralizedRegressor, CLR, ClusteredRegressor, AttnRegressor."
         )

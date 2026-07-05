@@ -36,9 +36,23 @@ from microbiome_model.data.dataset import DataProcessor, Arguments
 from microbiome_model.utils.misc import _mean_absolute_error
 from microbiome_model.training.pre_training_masked import MaskedAbundancePretraining
 
+def build_features(batch, meta_spec, device):
+    """Build [B, n_meta] integer feature tensor. None if meta_spec empty.
+    MUST match the training-time builder exactly."""
+    if not meta_spec:
+        return None
+    cols = []
+    for name, _card in meta_spec:
+        if name == "env":
+            cols.append(batch['env'].to(device).long())
+        elif name == "bimonth":
+            cols.append(batch['season'].to(device).long())
+        else:
+            raise ValueError(f"Unknown metadata feature: {name}")
+    return torch.stack(cols, dim=1)
 
-
-def predict(model, loader, device, scale_abundances=False, val=False, multitask=False):
+def predict(model, loader, device, scale_abundances=False, val=False,
+            multitask=False, meta_spec=None):
     """Generate predictions for a dataset"""
 
         #### D20 unique features
@@ -56,16 +70,16 @@ def predict(model, loader, device, scale_abundances=False, val=False, multitask=
     per_sample_preds = {}
     with torch.no_grad():
         for batch in loader:
-            print("Shape", batch['embeddings'].shape, batch['abundances'].shape, batch['masks'].shape, batch['season'].shape, batch['env'].shape)
             embeddings = batch['embeddings'].to(device, dtype=torch.float32)
             abundances = batch['abundances'].to(device) / 1e4 if scale_abundances else batch['abundances'].to(device)
             masks = batch['masks'].to(device)
             targets = batch['outdoor_add_0'].to(device)
             sample_ids = batch["SampleID"]
             all_ids.extend(batch["SampleID"])
-            env = batch['env'].to(device, dtype=torch.float32)  # 0 for indoor, 1 for outdoor
-            features = batch['season'].to(device)  # seasonal features
+            env_idx = batch['env'].to(device, dtype=torch.float32)  # 0 for indoor, 1 for outdoor
             seqids = batch['seqs_ids']  # list of lists of ASV IDs for each sample in the batch
+            features = build_features(batch, meta_spec, device)
+
             # print("Num non-zero ASVs per sample:", (abundances > 0).sum(-1).float().mean())
             # print("Top-1 abundance value:", abundances.max(-1).values.mean())
 
@@ -112,13 +126,13 @@ def predict(model, loader, device, scale_abundances=False, val=False, multitask=
 
 
 
-            outputss = model(embeddings, abundances, masks, features, env=env)
+            outputss = model(embeddings, abundances, masks, features)
             outputs = outputss[0]
             if multitask:
                 p_indoor = outputs[0]
                 p_outdoor = outputs[1]
-                mask_in = (env == 0).view(-1)
-                mask_out = (env == 1).view(-1)
+                mask_in = (env_idx == 0).view(-1)
+                mask_out = (env_idx == 1).view(-1)
                 all_outputs = torch.cat([p_indoor[mask_in], p_outdoor[mask_out]])
                 all_targets = torch.cat([targets[mask_in], targets[mask_out]])
                 outputs = all_outputs
@@ -300,12 +314,21 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path):
         # ---- Evaluate best run multiple times ----
         total_mae = []
         for k in range(eval_runs):
+            train_config_path = os.path.join(best_run_dir, "training_config.json")
+            if os.path.exists(train_config_path):
+                with open(train_config_path) as f:
+                    train_config = json.load(f)
+            
+                if "embedding_path" in train_config:
+                    print(f"Using embedding path from train_config.json: {train_config['embedding_path']}")
+                    embedding_path = train_config["embedding_path"]
+            print("embedding path: ", embedding_path)
             args = Arguments(
                 biom_file=biom_file,
                 metadata_file=metadata_file,
                 tree_path=None,
-                embedding_file=embedding_path,
-                embedding="DNABERT",
+            embedding_file=embedding_path,
+            embedding="DNABERT",
                 heldout=donor_id,
                 sort_asvs=True,
                 clr=False,
@@ -335,9 +358,18 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path):
             checkpoint = torch.load(os.path.join(best_run_dir, "model.pt"), map_location=device)
             model_a.load_state_dict(checkpoint, strict=True)
             model_a.to(device)
+            cards = model_cfg.get("metadata_cardinalities", [2,6])
+            CARD_TO_NAME = {2: "env", 6: "bimonth"}
+            if cards:
+                meta_spec = [(CARD_TO_NAME[c], c) for c in cards]
+            else:
+                meta_spec = []
+
+            print(f"meta_spec: {meta_spec}")
+
 
             labels, predictions, per_sample_pred = predict(
-                model_a, test_loader, device, scale_abundances=True, val = True, multitask=multitask
+                model_a, test_loader, device, scale_abundances=True, val = True, multitask=multitask, meta_spec=meta_spec
             )
             # # labels = np.expm1(labels)
             # # predictions = np.expm1(predictions)
@@ -594,7 +626,7 @@ if __name__ == "__main__":
 
         data_dir = "/s/chromatin/o/nobackup/Saira/Microbiome_Project/"
         output_dir = os.path.join(data_dir, "microbiome_model/results/ModelSelection/tmp")
-        output_dir = os.path.join(data_dir, "microbiome_model/results/all_data_dnabert_cls/") #clusteredbaseline2
+        output_dir = os.path.join(data_dir, "microbiome_model/results/all_data_seqmit_env_bimonth_attnpool_1/") #clusteredbaseline2
         biom_file = os.path.join(data_dir, "process_data_all/exported-feature-table/feature-table.biom")
         biom_file_sheds = os.path.join(data_dir, "data/new_data/feature-table/feature-table.biom")
         sheds_file = os.path.join(data_dir, "data/new_data/metadata_sheds.tsv")
@@ -602,6 +634,6 @@ if __name__ == "__main__":
         embedding_path = os.path.join(data_dir, "data/embeddings/all_data.h5") #all_data_s_dnabert
         donor_ids = pd.read_csv(sheds_file, sep="\t")['DonorID'].unique().tolist()
         #donor_ids = ["D4", "D5", "D6", "D7", "D8", "D9", "D10", "D11", "D12", "D13", "D14", "D15", "D16"]
-        donor_ids =   [ "D20", "D15", "D25"]  # , "D9"] #, "D26", "D9", "D27"] #[,"D25", "D29", "D15"] #,"D28", "D27", "D7","D25", "D15", "D13"] #, "D28", "D25", "D15", "D10", "D7"] #, "D25", "D28"]
+        donor_ids =    ['D24', 'D15', 'D20', 'D27', "D13", 'D22', "D5"]#,"D27", "D13","D15", "D20", "D24"] #, "D15", "D25"]  # , "D9"] #, "D26", "D9", "D27"] #[,"D25", "D29", "D15"] #,"D28", "D27", "D7","D25", "D15", "D13"] #, "D28", "D25", "D15", "D10", "D7"] #, "D25", "D28"]
         evaluate_basic(donor_ids, output_dir, metadata_file, biom_file, embedding_path)
         #evaluate_all_runs(donor_ids, output_dir, metadata_file, biom_file, embedding_path)
