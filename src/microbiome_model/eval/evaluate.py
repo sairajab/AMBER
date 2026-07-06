@@ -54,10 +54,10 @@ def predict(model, loader, device, scale_abundances=False, val=False,
             multitask=False, meta_spec=None):
     """Generate predictions for a dataset"""
 
-        #### D20 unique features
-    with open("../D12_unique_features.txt", "r") as f:
-        d20_unique_features = [line.strip() for line in f]
-        d20_unique_features = set(d20_unique_features)
+    #     #### D20 unique features
+    # with open("../D12_unique_features.txt", "r") as f:
+    #     d20_unique_features = [line.strip() for line in f]
+    #     d20_unique_features = set(d20_unique_features)
         
     model = model.to(device)
     model.eval()
