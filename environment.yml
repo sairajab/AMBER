@@ -18,6 +18,8 @@ dependencies:
   - pyyaml=6.0.2
   - ipykernel
   - unifrac-binaries=1.4
+  - hdf5=1.12.2
+  - cython=0.29.37
 
   - pip:
       - torch==2.8.0
