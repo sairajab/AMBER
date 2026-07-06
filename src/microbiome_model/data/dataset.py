@@ -11,11 +11,11 @@ from unifrac import unweighted
 import torch.nn.functional as F
 from biom.util import biom_open
 from torch.utils.data import Sampler
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupKFold, train_test_split
 
 
 from microbiome_model.data.dataset_sparse import MicrobiomeSparseDataset
-from microbiome_model.data.embedding_loader import compute_and_save_embeddings, compute_and_save_token_embeddings, compute_and_save_embeddings_fast
+from microbiome_model.data.embedding_loader import compute_and_save_embeddings, compute_and_save_token_embeddings, compute_and_save_embeddings_fast, EmbeddingLoader as RandomEmbeddingLoader
 from microbiome_model.data.optimized_embedding_loader import MemoryMappedEmbeddingLoader as EmbeddingLoader 
 
 
@@ -63,6 +63,8 @@ def one_body_out(sample_ids , donor_id = "D12"):
     test_ids = []
     train_samples = []
 
+    if donor_id is None:
+        return sample_ids, test_ids
     
     for id in sample_ids:
         if donor_id in id:
@@ -223,16 +225,27 @@ def finetuned_dna_bert(embedding_path, sequences, device):
             #     tokenizer=tokenizer,
             #     model=dnabert_model,
             #     output_path=embedding_path,
-            #     device=device
+            #     device=device,
+            #     pooling="mean"
             # )
 
-            compute_and_save_token_embeddings(
+            compute_and_save_embeddings_fast(
                 sequences=sequences,
                 tokenizer=tokenizer,
                 model=dnabert_model,
                 output_path=embedding_path,
-                device=device
+                batch_size=1024,  # Adjust batch size as needed
+                device=device,
+                pooling = "mean"
             )
+            # compute_and_save_token_embeddings(
+            #     sequences=sequences,
+            #     tokenizer=tokenizer,
+            #     model=dnabert_model,
+            #     output_path=embedding_path,
+            #     device=device,
+
+            # )
             
             # Free up memory
             #del dnabert_model
@@ -456,14 +469,17 @@ class DataProcessor:
                 )
             return seqs_kmers
 
-        else:
+        elif self.config.embedding == "DNABERT":
 
             if not os.path.exists(self.config.embedding_file):
                 print("Computing embeddings...")
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                s_dnabert(self.config.embedding_file, self.sequences, device)
-                #dna_bert(self.config.embedding_file, self.sequences, device)
+                #s_dnabert(self.config.embedding_file, self.sequences, device)
+                finetuned_dna_bert(self.config.embedding_file, self.sequences, device)
             return self.config.embedding_file
+        else:
+            return None
+
         
     def match_samples(self):
         if self.table is None or self.sample_targets is None:
@@ -655,13 +671,47 @@ class DataProcessor:
         print(f"  Val env: {dict(val_profile['env'].value_counts())}")
         
         return new_train_samples, val_samples
+
+    def create_groupkfold_splits(self, n_splits=5):
+
+        sample_ids = np.array(self.train_data[0])
+
+        donor_ids = np.array([
+            self.sampleID_map_donorID[s]
+            for s in sample_ids
+        ])
+
+        gkf = GroupKFold(n_splits=n_splits)
+
+        self.cv_splits = []
+
+        for train_idx, val_idx in gkf.split(
+                sample_ids,
+                groups=donor_ids):
+
+            train_samples = sample_ids[train_idx].tolist()
+            val_samples = sample_ids[val_idx].tolist()
+
+            self.cv_splits.append(
+                (train_samples, val_samples)
+            )
     
-    def sample_data(self, epoch, subsample = True, random_vector=False):
+    
+    def sample_data(self, epoch, subsample = True, get_fold=-1, random_vector=False):
     # Create datasets
 
         train_samples, train_targets = self.train_data
+
+        if get_fold >= 0 and hasattr(self, 'cv_splits'):
+            if get_fold >= len(self.cv_splits):
+                raise ValueError(f"get_fold index {get_fold} exceeds available splits {len(self.cv_splits)}")
+            train_samples, val_samples = self.cv_splits[get_fold]
+            train_targets = {sample_id: self.sample_targets[sample_id] for sample_id in train_samples}
+            val_targets = {sample_id: self.sample_targets[sample_id] for sample_id in val_samples}
+            self.val_data = (val_samples, val_targets)
+            print(f"Using fold {get_fold}: {len(train_samples)} train samples, {len(val_samples)} val samples.")
         
-        if self.val_data is None and epoch ==0:
+        elif self.val_data is None and epoch ==0:
             train_samples, val_samples = train_test_split(train_samples, test_size=0.1 , random_state=42)
             #train_samples, val_samples = self.donor_aware_split(train_samples, val_ratio=0.1)
             #train_samples, val_samples = self.stratified_donor_split(train_samples, val_ratio=0.1)
@@ -685,14 +735,16 @@ class DataProcessor:
         
         train_table = self.table.filter(train_samples , inplace = False)
         val_table = self.table.filter(val_samples , inplace = False)
-
+        print("Kmer embeddings:", self.config.kmer_embeddings, "Embedding file:", self.config.embedding_file)
         if not self.config.kmer_embeddings and self.config.embedding_file is None:
+                embedding_loader = RandomEmbeddingLoader(self.config.embedding_file, embedding_dim=768)
                 train_dataset = MicrobiomeSparseDataset(
                     biom_table=train_table,
                     one_hot_seqs=self.seqs_processed,
                     sample_targets=train_targets, 
                     sort_asvs=self.config.sort_asvs,
-                    random_vec=False, 
+                    embedding_loader=embedding_loader,
+                    random_vec=True, 
                     seed = epoch 
                 )
                 val_dataset = MicrobiomeSparseDataset(
@@ -700,7 +752,8 @@ class DataProcessor:
                     one_hot_seqs=self.seqs_processed,
                     sample_targets=val_targets, 
                     sort_asvs=self.config.sort_asvs,
-                    random_vec=False,
+                    embedding_loader=embedding_loader,
+                    random_vec=True,
                     seed = 9999
                 )
         elif not self.config.kmer_embeddings and self.config.embedding_file is not None:
@@ -746,6 +799,21 @@ class DataProcessor:
                         sample_targets=val_targets, random_vec=False,
                         seed=epoch
                     )
+        else:
+            train_dataset = MicrobiomeSparseDataset(
+                    biom_table=train_table,
+                    kmer_seqs=self.seqs_processed,
+                    sample_targets=train_targets, random_vec=True,
+                    seed = epoch
+                )
+            val_dataset = MicrobiomeSparseDataset(
+                        biom_table=val_table,
+                        sort_asvs=self.config.sort_asvs,
+                        sample_targets=val_targets, random_vec=True,
+                        seed=epoch
+                    )
+        
+
         
         train_y = train_dataset.get_targets()
         val_y = val_dataset.get_targets()
@@ -761,12 +829,15 @@ class DataProcessor:
 
 
         if not self.config.kmer_embeddings and self.config.embedding_file is None:
+                print("Using random embeddings for test data.")
+                embedding_loader = RandomEmbeddingLoader(self.config.embedding_file, embedding_dim=768)
                 test_dataset = MicrobiomeSparseDataset(
                     biom_table=test_table,
                     one_hot_seqs=self.seqs_processed,
                     sort_asvs=self.config.sort_asvs,
+                    embedding_loader=embedding_loader,
                     sample_targets=test_targets, 
-                    random_vec=random_vector, 
+                    random_vec=True, 
                     seed = epoch,
                     subsample=subsample
                 )

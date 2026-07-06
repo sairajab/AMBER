@@ -229,7 +229,6 @@ class MicrobiomeSparseDataset(Dataset):
             sorted_order = torch.arange(len(abundances), dtype=torch.long)
 
         #abundances = self.clr_transform(torch.tensor(abundances, dtype=torch.float32)).numpy()
-
         if self.kmer_seqs is not None:
             sample_embeddings = torch.stack([
                     self.kmer_seqs[seq_id] for seq_id in s_obs_ids

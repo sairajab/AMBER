@@ -34,7 +34,6 @@ from microbiome_model.models.orig import BasicRegressor, BasicRegressorwithUnifr
 from microbiome_model.data.dataset_sparse import collate_fn as sparse_collate_fn
 from microbiome_model.data.dataset import DataProcessor, Arguments
 from microbiome_model.utils.misc import _mean_absolute_error
-from microbiome_model.training.pre_training_masked import MaskedAbundancePretraining
 
 def build_features(batch, meta_spec, device):
     """Build [B, n_meta] integer feature tensor. None if meta_spec empty.
