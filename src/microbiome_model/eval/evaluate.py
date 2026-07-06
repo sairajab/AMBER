@@ -137,16 +137,16 @@ def predict(model, loader, device, scale_abundances=False, val=False,
                 outputs = all_outputs
                 targets = all_targets
             
-            if val:
-                for i in range(targets.shape[0]):
-                    seqs = seqids[i]  # list of ASV IDs for this sample
-                    uniq_feats = 0
-                    for s in seqs:
-                        if s in d20_unique_features:
-                            uniq_feats += 1
+            # if val:
+            #     for i in range(targets.shape[0]):
+            #         seqs = seqids[i]  # list of ASV IDs for this sample
+            #         uniq_feats = 0
+            #         for s in seqs:
+            #             if s in d20_unique_features:
+            #                 uniq_feats += 1
                         
 
-                    per_sample_preds[sample_ids[i]] = [float(outputs[i].cpu()), float(targets[i].cpu()), uniq_feats]
+            #         per_sample_preds[sample_ids[i]] = [float(outputs[i].cpu()), float(targets[i].cpu()), uniq_feats]
                 
             # loss = criterion(outputs, targets)
             # test_loss += loss.item()        
