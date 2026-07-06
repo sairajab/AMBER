@@ -26,26 +26,23 @@ import matplotlib.pyplot as plt
 import torch.optim as optim
 from transformers import get_cosine_schedule_with_warmup
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import train_test_split
 
 # ---- project imports ----
 from microbiome_model.models import build_model
-from microbiome_model.models.orig import BasicRegressor, BasicRegressorwithUnifrac
-from microbiome_model.models.zoo import BasicRegressorBest, BasicRegressorGRL, CLR, ClusteredRegressor, SoftADDContrastiveLoss, ContrastiveEncoder
 from microbiome_model.data.dataset import Arguments, DataProcessor
 from microbiome_model.losses.core import compute_count_loss, PairwiseLoss, distance_weighted_ce
 from microbiome_model.eval.evaluate import predict
 from microbiome_model.utils.misc import _mean_absolute_error, compute_diversity_indices, create_augmented_batch_DDD 
 from microbiome_model.data.dataset_sparse import collate_fn as sparse_collate_fn, DonorAwareSampler
-from microbiome_model.training.pre_training_masked import MaskedAbundancePretraining
+#from microbiome_model.training.pre_training_masked import MaskedAbundancePretraining
 from torch.optim.swa_utils import AveragedModel
 
 
 # ============================================================
-# ABLATION CONFIG — change ONLY this block between runs
+# ABLATION CONFIG 
 # ============================================================
 ABLATION = {
     "name": "seqmit_env_bimonth",        # goes into output path + saved config
