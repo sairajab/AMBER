@@ -633,6 +633,5 @@ if __name__ == "__main__":
         embedding_path = os.path.join(data_dir, "data/embeddings/all_data.h5") #all_data_s_dnabert
         donor_ids = pd.read_csv(sheds_file, sep="\t")['DonorID'].unique().tolist()
         #donor_ids = ["D4", "D5", "D6", "D7", "D8", "D9", "D10", "D11", "D12", "D13", "D14", "D15", "D16"]
-        donor_ids =    ['D24', 'D15', 'D20', 'D27', "D13", 'D22', "D5"]#,"D27", "D13","D15", "D20", "D24"] #, "D15", "D25"]  # , "D9"] #, "D26", "D9", "D27"] #[,"D25", "D29", "D15"] #,"D28", "D27", "D7","D25", "D15", "D13"] #, "D28", "D25", "D15", "D10", "D7"] #, "D25", "D28"]
         evaluate_basic(donor_ids, output_dir, metadata_file, biom_file, embedding_path)
         #evaluate_all_runs(donor_ids, output_dir, metadata_file, biom_file, embedding_path)

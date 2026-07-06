@@ -20,4 +20,8 @@ environment; it is not covered by `environment.yml`.
 python src/microbiome_model/training/train_orig.py
 ```
 
+## Evaluate 
+```bash
+python src/microbiome_model/eval/evaluate.py
+```
 See `job.sh` for an example SLURM submission.
