@@ -1305,7 +1305,7 @@ class BasicRegressor3(nn.Module):
 
         if self.training:
 
-            abundances += torch.randn_like(abundances) * 0.01
+            abundances = abundances +  torch.randn_like(abundances) * 0.01
             dropout_mask = torch.rand_like(masks.float()) < 0.05
             new_masks = masks.bool() & ~dropout_mask.bool()
             empty = new_masks.sum(dim=1) == 0          
@@ -1699,9 +1699,14 @@ class BasicRegressor5(nn.Module):
             print("Using Gradient Reversal Layer with unique_donors_train =", unique_donors_train)
 
         self.scale_embeddings = nn.Sequential(
-            nn.Linear(768, input_dim),
-         nn.LayerNorm(input_dim),
+            nn.LayerNorm(768),           # 1. Normalize the frozen distribution
+            nn.Dropout(0.1),             # 2. Prevent over-reliance on static features
+            nn.Linear(768, 384),         # 3. Funnel down safely
+            nn.GELU(),
+            nn.Linear(384, input_dim),
+            nn.LayerNorm(input_dim)      # 4. Final normalization for your Transformer
         )
+        
         self.query_vector = nn.Parameter(torch.randn(1, 1, input_dim) / np.sqrt(input_dim))
 
         if self.pe:
@@ -1746,6 +1751,7 @@ class BasicRegressor5(nn.Module):
                 nn.Linear(1, input_dim), nn.LayerNorm(input_dim), nn.GELU())
         self.norm = nn.LayerNorm(input_dim)
         self.film = nn.Linear(input_dim, 2 * input_dim) 
+        self.meta_proj = nn.Linear(self.n_meta_tokens * input_dim, input_dim)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -1766,6 +1772,9 @@ class BasicRegressor5(nn.Module):
         nn.init.normal_(self.query_vector, mean=0.0, std=0.02)
         if self.pe:
             nn.init.normal_(self.pos_embedding.position_embeddings.weight, mean=0.0, std=0.02)
+        self.meta_proj.apply(init_weights)
+        torch.nn.init.zeros_(self.film.weight)
+        torch.nn.init.zeros_(self.film.bias)
 
     def forward(self, input_embeddings, abundances, masks,
                 features=None, donor_ids=None):
@@ -1779,15 +1788,7 @@ class BasicRegressor5(nn.Module):
         asv_embeddings = self.scale_embeddings(input_embeddings)
 
 
-        if features is not None and self.n_meta_tokens > 0:
-            assert features.shape[1] == self.n_meta_tokens, (
-                f"Expected {self.n_meta_tokens} metadata columns, got {features.shape[1]}")
-            meta_vec = 0
-            for j, emb in enumerate(self.metadata_embeddings):
-                meta_vec = meta_vec + emb(features[:, j].long())   # [B, D] each, summed
-            
-            gamma, beta = self.film(meta_vec).chunk(2, dim=-1)         # each [B, D]
-            asv_embeddings = (1 + gamma).unsqueeze(1) * asv_embeddings + beta.unsqueeze(1)
+
             
         if self.clr:
             weighted = asv_embeddings + abundances
@@ -1806,7 +1807,19 @@ class BasicRegressor5(nn.Module):
         # Count prediction from ASV positions (skip CLS at index 0)
         count_pred = self.count_out(asv_refined[:, :, :])
 
+        if features is not None and self.n_meta_tokens > 0:
+            assert features.shape[1] == self.n_meta_tokens, (
+                f"Expected {self.n_meta_tokens} metadata columns, got {features.shape[1]}")
+            meta_vec = 0
+            meta_list = [emb(features[:, j].long()) for j, emb in enumerate(self.metadata_embeddings)]
+            meta_vec = torch.cat(meta_list, dim=-1)         # [B, n_meta_tokens * D]
+            meta_vec = self.meta_proj(meta_vec)
 
+            # for j, emb in enumerate(self.metadata_embeddings):
+            #     meta_vec = meta_vec + emb(features[:, j].long())   # [B, D] each, summed
+            
+            gamma, beta = self.film(meta_vec).chunk(2, dim=-1)         # each [B, D]
+            asv_refined = (1 + gamma).unsqueeze(1) * asv_refined + beta.unsqueeze(1)
 
 
        
@@ -1945,8 +1958,8 @@ class BasicRegressor6(nn.Module):
 
         if self.training:
                     # if self.training: 
-            abundances += torch.randn_like(abundances) * 0.01
-            dropout_mask = torch.rand_like(masks.float()) < 0.05
+            abundances = abundances +  torch.randn_like(abundances) * 0.01
+            dropout_mask = torch.rand_like(masks.float()) < 0.01
             new_masks = masks.bool() & ~dropout_mask.bool()
             empty = new_masks.sum(dim=1) == 0          
             new_masks[empty] = masks.bool()[empty]     
