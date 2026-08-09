@@ -62,7 +62,11 @@ def build_model(cfg: dict, device: str = "cpu"):
             num_layers=cfg.get("num_layers", 2),
             dropout=cfg.get("dropout", 0.2),
             pe=cfg.get("pe", False),
+            grl =cfg.get("grl", False),
+            clr =cfg.get("clr", False),
+            unique_donors_train=cfg.get("num_donors", 0),
             metadata_cardinalities=cfg.get("metadata_cardinalities", None),
+            
         )
 
     elif name == "BasicRegressorGRL":

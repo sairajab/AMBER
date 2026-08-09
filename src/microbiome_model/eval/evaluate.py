@@ -137,16 +137,15 @@ def predict(model, loader, device, scale_abundances=False, val=False,
                 outputs = all_outputs
                 targets = all_targets
             
-            # if val:
-            #     for i in range(targets.shape[0]):
-            #         seqs = seqids[i]  # list of ASV IDs for this sample
-            #         uniq_feats = 0
-            #         for s in seqs:
-            #             if s in d20_unique_features:
-            #                 uniq_feats += 1
-                        
+            if val:
+                for i in range(targets.shape[0]):
+                    # seqs = seqids[i]  # list of ASV IDs for this sample
+                    uniq_feats = 0
+                    # for s in seqs:
+                    #     if s in d20_unique_features:
+                    #         uniq_feats += 1
 
-            #         per_sample_preds[sample_ids[i]] = [float(outputs[i].cpu()), float(targets[i].cpu()), uniq_feats]
+                    per_sample_preds[sample_ids[i]] = [float(outputs[i].cpu()), float(targets[i].cpu()), uniq_feats]
                 
             # loss = criterion(outputs, targets)
             # test_loss += loss.item()        
@@ -274,14 +273,13 @@ def evaluate_all_runs(donor_ids, res,  metadata_file, biom_file, embedding_path)
             with open(run_dir + "test_eval.json", "w") as f:
                 json.dump({"test_mae": float(mae_t)}, f, indent=2)
 
-def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path):
+def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path, eval_runs=3, runs=3):
     results = {}
     results_valid = {}
     all_labels = []
     all_predictions = []
     all_sample_ids = []
-    eval_runs = 10
-    runs = 3
+
     multitask = False
     mean_mae = 0
 
@@ -337,7 +335,7 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path):
             
             test_dataset = data_processor.sample_test_data(epoch=k)
             test_loader = torch.utils.data.DataLoader(
-                test_dataset, batch_size=16, shuffle=False, num_workers=4, collate_fn=sparse_collate_fn
+                test_dataset, batch_size=32, shuffle=False, num_workers=4, collate_fn=sparse_collate_fn
             )
 
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -345,18 +343,25 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path):
             if os.path.exists(cfg_path):
                 with open(cfg_path) as f:
                     model_cfg = json.load(f)
-                    if "model_name" not in model_cfg:
-                        model_cfg["model_name"] = "BasicRegressor"
+                    #if "model_name" not in model_cfg:
+                    print("overriding model_name to BasicRegressor for evaluation")
+                    model_cfg["model_name"] = "BasicRegressor1"
             else:
                 logging.warning(
                     "model_config.json not found in %s; falling back to default BasicRegressor config.",
                     best_run_dir,
                 )
                 model_cfg = {"model_name": "BasicRegressor", "input_dim": 128, "pe": False}
+            print(f"Using model config: {model_cfg}")
             model_a = build_model(model_cfg, str(device))
             checkpoint = torch.load(os.path.join(best_run_dir, "model.pt"), map_location=device)
             model_a.load_state_dict(checkpoint, strict=True)
             model_a.to(device)
+            print(f"Loaded model {model_cfg['model_name']} from {best_run_dir}")
+            print(model_a)
+            print("Checkpoint keys and tensor sizes:")
+            for key, tensor in checkpoint.items():
+                print(f"{key}: {tensor.size()}")
             cards = model_cfg.get("metadata_cardinalities", [2,6])
             CARD_TO_NAME = {2: "env", 6: "bimonth"}
             if cards:
@@ -389,6 +394,7 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path):
 
             donor_labels.extend(labels * 100)
             donor_preds.extend(predictions * 100)
+            print("Sample IDs: ", sample_ids)
             donor_sample_ids.extend(sample_ids)
 
         avg_mae = np.mean(total_mae)
@@ -430,10 +436,12 @@ def _plot_face_hip_colored(predictions, labels, sample_ids, save_path):
     
     predictions = np.array(predictions).flatten()
     labels = np.array(labels).flatten()
-    
+    print(sample_ids)
     # Identify face vs hip from sample IDs
     is_face = np.array(['SKF' in str(sid) for sid in sample_ids])
     is_hip = np.array(['SKH' in str(sid) for sid in sample_ids])
+    print(is_face.dtype, is_face)
+    print(is_hip.dtype, is_hip)
     is_other = ~(is_face | is_hip)
     
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -477,6 +485,8 @@ def _plot_residuals_face_hip(predictions, labels, sample_ids, save_path):
     
     is_face = np.array(['SKF' in str(sid) for sid in sample_ids])
     is_hip = np.array(['SKH' in str(sid) for sid in sample_ids])
+    print(is_face.dtype)
+    print(is_hip.dtype)
     is_other = ~(is_face | is_hip)
     
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -625,13 +635,13 @@ if __name__ == "__main__":
 
         data_dir = "/s/chromatin/o/nobackup/Saira/Microbiome_Project/"
         output_dir = os.path.join(data_dir, "microbiome_model/results/ModelSelection/tmp")
-        output_dir = os.path.join(data_dir, "microbiome_model/results/all_data_seqmit_env_bimonth_attnpool_1/") #clusteredbaseline2
+        output_dir = os.path.join(data_dir, "microbiome_model/results//all_data_seqmit_env_bimonth_curr_model") #clusteredbaseline2
         biom_file = os.path.join(data_dir, "process_data_all/exported-feature-table/feature-table.biom")
         biom_file_sheds = os.path.join(data_dir, "data/new_data/feature-table/feature-table.biom")
         sheds_file = os.path.join(data_dir, "data/new_data/metadata_sheds.tsv")
         metadata_file = os.path.join(data_dir, "data/new_data/combined_metadata_merged.tsv")
         embedding_path = os.path.join(data_dir, "data/embeddings/all_data.h5") #all_data_s_dnabert
         donor_ids = pd.read_csv(sheds_file, sep="\t")['DonorID'].unique().tolist()
-        #donor_ids = ["D4", "D5", "D6", "D7", "D8", "D9", "D10", "D11", "D12", "D13", "D14", "D15", "D16"]
-        evaluate_basic(donor_ids, output_dir, metadata_file, biom_file, embedding_path)
+        donor_ids = ["D24"] #,"D22", "D27", "D24", "D29", "D12", "D6", "D8", "D10", "D19", "D21", "D23", "D25", "D11"]
+        evaluate_basic(donor_ids, output_dir, metadata_file, biom_file, embedding_path, eval_runs=10, runs=3)
         #evaluate_all_runs(donor_ids, output_dir, metadata_file, biom_file, embedding_path)

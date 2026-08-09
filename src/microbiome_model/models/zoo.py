@@ -868,6 +868,7 @@ class BasicRegressor1(nn.Module):
             self.abundance_proj = nn.Sequential(
                 nn.Linear(1, input_dim), nn.LayerNorm(input_dim), nn.GELU())
         self.norm = nn.LayerNorm(input_dim)
+        self.attn_pooling = AttentionPool(input_dim)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -953,7 +954,7 @@ class BasicRegressor1(nn.Module):
         # Count prediction from ASV positions (skip CLS at index 0)
         count_pred = self.count_out(asv_refined[:, :, :])
 
-        asv_refined = asv_embeddings + asv_refined * F.softplus(self._count_alpha)
+        #asv_refined = asv_embeddings + asv_refined * F.softplus(self._count_alpha)
 
         # --- Dynamic metadata tokens ---
         if features is not None and self.n_meta_tokens > 0:

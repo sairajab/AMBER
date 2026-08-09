@@ -45,7 +45,7 @@ from torch.optim.swa_utils import AveragedModel
 # ABLATION CONFIG 
 # ============================================================
 ABLATION = {
-    "name": "seqmit_env_bimonth",        # goes into output path + saved config
+    "name": "seqmit_env_bimonth_late_metadata_post_norm",        # goes into output path + saved config
     "use_env": True,                     # include env metadata token
     "use_bimonth": True,                 # include bimonth metadata token
     "use_count_loss": True,              # auxiliary abundance head
@@ -192,7 +192,7 @@ def train_model_GRL(model, num_epochs, learning_rate, device, out_dir, data_proc
 
 
     # Optimization
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
+    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=0.001)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-6
     )
@@ -395,7 +395,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
     patience = train_config.get("patience", 30)
     grl_loss_weight = train_config.get("grl_loss_weight", 0.1)
     use_count_loss = train_config.get("use_count_loss", True)
-    optimizer = AdamW(model.parameters(), lr=lr)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.001)
     subsample_table = train_config.get("subsample", True)
 
     if hasattr(model, 'basemodel'):
@@ -409,7 +409,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
     patience_counter = 0
     best_mae = 1000
     step = 0
-    smooth_window      = 5
+    smooth_window      = 1
     best_smoothed_mae  = float('inf')
     best_model_path    = f'{out_dir}/model.pt'
     
@@ -792,13 +792,14 @@ def main():
     }
 
     experiment_name = f"all_data_{ABLATION['name']}"
-    output_dir = os.path.join(data_dir, f"microbiome_model/results/{experiment_name}/") #clusteredbaseline2
+    output_dir = os.path.join(data_dir, f"microbiome_model/results/final/{experiment_name}/") #clusteredbaseline2
 
     EXP_DATA = datasets["ALL_DATA"] # Change to switch dataset
     biom_file, metadata_file, embedding_path = EXP_DATA
 
-    computed = []
+    computed = ["D13", "D15", "D20", "D22", "D27", "D24", "D29", "D12", "D6", "D8", "D10", "D19", "D21", "D23", "D25", "D11"]
     heldout_samples = [s for s in heldout_samples if s not in computed]
+    heldout_samples = ["D15", "D13", "D27"]
 
 
     print(f"Heldout samples for this experiment: {heldout_samples}")
@@ -807,7 +808,7 @@ def main():
     if not os.path.exists(output_dir):
         os.mkdir(output_dir)
     seed_values = [42, 1337, 2048]
-    grl = False
+    grl = ABLATION["grl"]
     clr = False
 
     # Create a directory for each heldout sample
@@ -826,7 +827,7 @@ def main():
         
         multitask = True
         model_config = {
-            "model_name": "AMBERRegressor",
+            "model_name": "BasicRegressor",
             "input_dim": 256,
             "hidden_dim": 1024,
             "num_heads": 4,
@@ -839,6 +840,7 @@ def main():
             "clr": ABLATION["clr"],
             "metadata_cardinalities": metadata_cardinalities,   # <-- drives the model
             "pretrained_weights": os.path.join(data_dir, "microbiome_model/results/MaskedPretrainSkin/pretrained_best.pt"),
+            "num_donors": 74
         }
         train_config = {
                 "batch_size": 32,

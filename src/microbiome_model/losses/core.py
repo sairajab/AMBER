@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -85,6 +86,51 @@ def pairwise_distances(embeddings, squared=False):
         distances = distances * (1.0 - mask)  # ✅ avoid in-place *=
     
     return distances
+
+
+class DensityWeightedMSELoss(nn.Module):
+    """MSE reweighted by inverse label density (LDS-style), so a training
+    target's contribution to the loss doesn't shrink just because its value
+    is rare in the training set (e.g. older ages in a young-skewed cohort).
+    Without this, MSE alone regresses sparse-region predictions toward the
+    dense region's mean, since that minimizes average squared error.
+
+    Weights are computed once from the training label distribution, then
+    smoothed with a small triangular kernel over histogram bins so a single
+    noisy bin count doesn't produce a wildly unstable weight.
+    """
+    def __init__(self, train_labels, n_bins=20, target_scale=1.0,
+                 kernel_size=5, min_weight=0.2, max_weight=8.0):
+        """
+        Args:
+            train_labels: raw (unscaled) training targets, e.g. ages in years.
+            target_scale: the tensors passed to forward() are assumed to be
+                train_labels * target_scale (e.g. 0.1 if targets are age/10).
+        """
+        super().__init__()
+        labels = np.asarray(train_labels, dtype=np.float64)
+        counts, bin_edges = np.histogram(labels, bins=n_bins)
+
+        kernel = np.bartlett(kernel_size + 2)[1:-1]  # simple triangular smoothing kernel
+        kernel = kernel / kernel.sum()
+        smoothed_counts = np.convolve(counts.astype(np.float64), kernel, mode='same')
+        smoothed_counts = np.clip(smoothed_counts, a_min=1.0, a_max=None)
+
+        weights = 1.0 / smoothed_counts
+        weights = weights / weights.mean()  # keep overall loss magnitude roughly unchanged
+        weights = np.clip(weights, min_weight, max_weight)
+
+        self.register_buffer('bin_edges', torch.tensor(bin_edges, dtype=torch.float32))
+        self.register_buffer('bin_weights', torch.tensor(weights, dtype=torch.float32))
+        self.target_scale = target_scale
+
+    def forward(self, pred, target):
+        with torch.no_grad():
+            labels = target.detach().float() / self.target_scale
+            idx = torch.bucketize(labels.contiguous(), self.bin_edges[1:-1])
+            idx = idx.clamp(0, self.bin_weights.numel() - 1)
+            w = self.bin_weights[idx.view(-1)].view_as(target)
+        return ((pred - target) ** 2 * w).mean()
 
 
 class PairwiseLoss(nn.Module):

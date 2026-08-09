@@ -82,14 +82,20 @@ class DonorAwareSampler(torch.utils.data.Sampler):
     
     
 class MicrobiomeSparseDataset(Dataset):
-    def __init__(self, biom_table, sample_targets, sort_asvs=True, embedding_loader=None, kmer_seqs=None, one_hot_seqs=None, test_split = False,random_vec=False, seed = None, env = None, sample_metadata = None, n_bins = 50, subsample= True, clr = False):
+    def __init__(self, biom_table, sample_targets, sort_asvs=True, embedding_loader=None, kmer_seqs=None, one_hot_seqs=None, test_split = False,random_vec=False, seed = None, env = None, sample_metadata = None, n_bins = 50, subsample= True, clr = False, categorical_metadata = None):
         """
         Dataset class for sample-level microbiome data using disk-based embeddings.
-        
+
         Args:
             biom_data (pd.DataFrame): Abundance data
             embedding_path (str): Path to H5 file containing embeddings
             sample_targets (dict): Dictionary mapping sample IDs to target values
+            categorical_metadata (dict[str, dict]): Optional mapping of
+                metadata_name -> {sample_id: category_index}. Any number of
+                fields can be supplied (e.g. {"sex": {...}, "country": {...}});
+                index 0 is reserved for unknown/missing, matching
+                BasicRegressor's metadata embedding convention. Samples not
+                present in a mapping default to 0.
         """
         self.biom_table =  biom_table.copy()
         self.sample_targets = sample_targets
@@ -116,6 +122,7 @@ class MicrobiomeSparseDataset(Dataset):
         # Open embedding file in read mode
         self.embedding_loader = embedding_loader
         self.sample_seasons = sample_metadata
+        self.categorical_metadata = categorical_metadata or {}
         self.env_bool = None
         self.n_bins = n_bins
         self.clr = clr
@@ -274,7 +281,11 @@ class MicrobiomeSparseDataset(Dataset):
             'outdoor_add_0': torch.FloatTensor([self.sample_targets[sample_id]]),
             'seqs_ids': seqs_ids,
             'env': self.env_bool[sample_id] if self.env_bool is not None else -1,
-            'season': self.sample_seasons[sample_id] if self.sample_seasons is not None else -1
+            'season': self.sample_seasons[sample_id] if self.sample_seasons is not None else -1,
+            'categorical_metadata': {
+                name: mapping.get(sample_id, 0)
+                for name, mapping in self.categorical_metadata.items()
+            }
         }
 
 
@@ -325,7 +336,18 @@ def collate_fn(batch):
         batch_masks[i, :length] = 1
     for i, seqs in enumerate(seqs_ids):
         padded_seqs_ids[i] = seqs + [None] * (max_len - len(seqs))
-        
+
+    # Generic categorical metadata -> [B, n_meta] LongTensor, in whatever
+    # order the dataset's categorical_metadata dict was built with.
+    meta_names = list(batch[0].get('categorical_metadata', {}).keys())
+    if meta_names:
+        features = torch.tensor(
+            [[item['categorical_metadata'][name] for name in meta_names] for item in batch],
+            dtype=torch.long
+        )
+    else:
+        features = None
+
     #targets = torch.log1p(targets)  # Log-transform targets for better numerical stability
     #print("Batch shape:", padded_abundances.shape)
     return {
@@ -337,7 +359,9 @@ def collate_fn(batch):
         'seqs_ids': padded_seqs_ids,
         'env': torch.tensor(envs),
         'season': torch.tensor(seasons, dtype=torch.float32),
-        'binned_abundances': padded_binned_abundances  # (Batch, Max_Len)
+        'binned_abundances': padded_binned_abundances,  # (Batch, Max_Len)
+        'features': features,  # (Batch, n_meta) or None
+        'meta_names': meta_names,
     }
 
 
