@@ -45,7 +45,7 @@ from torch.optim.swa_utils import AveragedModel
 # ABLATION CONFIG 
 # ============================================================
 ABLATION = {
-    "name": "seqmit_env_bimonth_late_metadata_post_norm",        # goes into output path + saved config
+    "name": "seqmit_env_bimonth_restored_model_film_b64_2",        # goes into output path + saved config
     "use_env": True,                     # include env metadata token
     "use_bimonth": True,                 # include bimonth metadata token
     "use_count_loss": True,              # auxiliary abundance head
@@ -424,13 +424,20 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
     num_training_steps = len(train_loader) * epochs
     num_warmup_steps = int(0.05 * num_training_steps)  # 5% warmup
 
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps
-)
-    swa_model = AveragedModel(model)
-    swa_start = int(0.6 * epochs)
+#     scheduler = get_cosine_schedule_with_warmup(
+#         optimizer,
+#         num_warmup_steps=num_warmup_steps,
+#         num_training_steps=num_training_steps
+# )
+#     swa_model = AveragedModel(model)
+#     swa_start = int(0.6 * epochs)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=10,
+            T_mult=2,
+            eta_min=0.00005
+        )
     
     distances_target = None
     bins = False
@@ -505,7 +512,6 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
                 continue
 
             optimizer.zero_grad()
-            scheduler.step()
             if grl:
                 outputs, counts_pred, unifrac_embeddings,_,  subj_pred = model(embeddings, abundances, masks, features)
             else:
@@ -549,14 +555,16 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
+
             step += 1
             train_loss += total_loss.item()
             per_batch_count_loss += count_loss.item()
 
         current_lr = optimizer.param_groups[0]['lr']
         lrs.append(current_lr)
-        
+            
 
+        scheduler.step()
 
         labels = np.concatenate(labels)
         predictions = np.concatenate(predictions)
@@ -760,7 +768,7 @@ def main():
     mode = "train"
     # Setup
     logging.basicConfig(level=logging.INFO)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
     
     #train_loader, val_loader, test_loader = reload_data()
@@ -797,11 +805,9 @@ def main():
     EXP_DATA = datasets["ALL_DATA"] # Change to switch dataset
     biom_file, metadata_file, embedding_path = EXP_DATA
 
-    computed = ["D13", "D15", "D20", "D22", "D27", "D24", "D29", "D12", "D6", "D8", "D10", "D19", "D21", "D23", "D25", "D11"]
+    computed = ["D13", "D15", "D20", "D27", "D24", "D29", "D12", "D6", "D8", "D10", "D19", "D21", "D23", "D25", "D11"]
     heldout_samples = [s for s in heldout_samples if s not in computed]
-    heldout_samples = ["D15", "D13", "D27"]
-
-
+    heldout_samples = ["D22","D18", "D19", "D21", "D25", "D26", "D28"]
     print(f"Heldout samples for this experiment: {heldout_samples}")
     
     #pd.read_csv(metadata_file)[""]
@@ -827,11 +833,11 @@ def main():
         
         multitask = True
         model_config = {
-            "model_name": "BasicRegressor",
-            "input_dim": 256,
-            "hidden_dim": 1024,
-            "num_heads": 4,
-            "num_layers": 2,
+            "model_name": "BasicRegressorFilm",
+            "input_dim": 128,
+            "hidden_dim": 512,
+            "num_heads": 8,
+            "num_layers": 4,
             "dropout": 0.3,
             "pe": False,
             "multitask": multitask,
@@ -843,17 +849,17 @@ def main():
             "num_donors": 74
         }
         train_config = {
-                "batch_size": 32,
+                "batch_size": 64,
                 "learning_rate": 1e-04,
                 "reg_count_loss": 1.0,  # Weight for count reconstruction loss
                 "early_stop_warmup": 15,
-                "patience": 30,
+                "patience": 15,
                 "num_epochs": 200,
                 "use_unifrac_loss": False,
                 "scale_abundance": True,
                 "seeds": seed_values,
                 "grl": grl, 
-                "grl_loss_weight": 1.0,
+                "grl_loss_weight": 0.1,
                 "subsample": True,  
                 "embedding_path": embedding_path,
                 'embedding_type': "DNABERT",

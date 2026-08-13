@@ -734,7 +734,7 @@ class BasicRegressorFilm(nn.Module):
         target_encoded = self.sample_attention(
             asv_refined, src_key_padding_mask=full_pad_mask)
 
-        summary = target_encoded[:,0,:]
+        summary = self.norm(target_encoded[:,0,:])
         #self.attn_pooling(target_encoded, masks)
 
         if self.grl:
@@ -871,6 +871,7 @@ class BasicRegressorFilm2(nn.Module):
         # Count prediction from ASV positions (skip CLS at index 0)
         count_pred = self.count_out(asv_refined[:, 1:, :])
 
+        asv_refined[:, 1:, :] = asv_refined[:, 1:, :] + asv_embeddings  # Residual connection to original embeddings
         # --- Dynamic metadata tokens ---
         if features is not None and self.n_meta_tokens > 0:
             assert features.shape[1] == self.n_meta_tokens, (
