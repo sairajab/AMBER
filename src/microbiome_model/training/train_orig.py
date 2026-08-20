@@ -45,7 +45,7 @@ from torch.optim.swa_utils import AveragedModel
 # ABLATION CONFIG 
 # ============================================================
 ABLATION = {
-    "name": "seqmit_env_bimonth_restored_model_film_b64_2",        # goes into output path + saved config
+    "name": "seqmit_env_bimonth_restored_model_film_b64",        # goes into output path + saved config
     "use_env": True,                     # include env metadata token
     "use_bimonth": True,                 # include bimonth metadata token
     "use_count_loss": True,              # auxiliary abundance head
@@ -768,7 +768,7 @@ def main():
     mode = "train"
     # Setup
     logging.basicConfig(level=logging.INFO)
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     
     #train_loader, val_loader, test_loader = reload_data()
@@ -791,7 +791,7 @@ def main():
 
     sheds_file = os.path.join(data_dir, "data/new_data/metadata_sheds.tsv")
     metadata_file = os.path.join(data_dir, "data/new_data/combined_metadata_merged.tsv")
-    embedding_path = os.path.join(data_dir, "data/embeddings/all_data.h5")
+    embedding_path = os.path.join(data_dir, "data/embeddings/all_data.h5") #all_data.h5"
     heldout_samples = pd.read_csv(sheds_file, sep="\t")['DonorID'].unique().tolist()
 
     
@@ -799,15 +799,19 @@ def main():
                 "ALL_DATA" : [biom_file, metadata_file, embedding_path]
     }
 
-    experiment_name = f"all_data_{ABLATION['name']}"
+
+
+    EXP_DATA = datasets["SHEDS"] # Change to switch dataset
+    biom_file, metadata_file, embedding_path = EXP_DATA
+    
+    
+    experiment_name = f"sheds_{ABLATION['name']}"
     output_dir = os.path.join(data_dir, f"microbiome_model/results/final/{experiment_name}/") #clusteredbaseline2
 
-    EXP_DATA = datasets["ALL_DATA"] # Change to switch dataset
-    biom_file, metadata_file, embedding_path = EXP_DATA
-
-    computed = ["D13", "D15", "D20", "D27", "D24", "D29", "D12", "D6", "D8", "D10", "D19", "D21", "D23", "D25", "D11"]
+    computed = ["D5", "D7", "D9", "D13", "D14", "D15", "D20", "D22", "D24", "D26", "D27", "D28", "D30"]
     heldout_samples = [s for s in heldout_samples if s not in computed]
-    heldout_samples = ["D22","D18", "D19", "D21", "D25", "D26", "D28"]
+    
+    heldout_samples = ["D23", "D24", "D25", "D26", "D27", "D28", "D29", "D30"] # For testing purposes, limit to a few donors
     print(f"Heldout samples for this experiment: {heldout_samples}")
     
     #pd.read_csv(metadata_file)[""]
@@ -816,23 +820,8 @@ def main():
     seed_values = [42, 1337, 2048]
     grl = ABLATION["grl"]
     clr = False
-
-    # Create a directory for each heldout sample
-    for j in range(len(heldout_samples)):
-        
-        heldout = heldout_samples[j]
-        print(f"Running for heldout sample: {heldout}")
-        out_dir = os.path.join(output_dir, heldout)
-        if not os.path.exists(out_dir):
-            os.mkdir(out_dir)
-            
-
-        runs = 3
-
-        #abundance_table, train_data , test_data, embedding_path, distances = load_data(args
-        
-        multitask = True
-        model_config = {
+    multitask = True
+    model_config = {
             "model_name": "BasicRegressorFilm",
             "input_dim": 128,
             "hidden_dim": 512,
@@ -848,7 +837,7 @@ def main():
             "pretrained_weights": os.path.join(data_dir, "microbiome_model/results/MaskedPretrainSkin/pretrained_best.pt"),
             "num_donors": 74
         }
-        train_config = {
+    train_config = {
                 "batch_size": 64,
                 "learning_rate": 1e-04,
                 "reg_count_loss": 1.0,  # Weight for count reconstruction loss
@@ -862,8 +851,26 @@ def main():
                 "grl_loss_weight": 0.1,
                 "subsample": True,  
                 "embedding_path": embedding_path,
-                'embedding_type': "DNABERT",
+                'embedding_type': "DNABERT",  # or "DNABERT" or "RANDOM"
             }
+        
+    embedding_path = None if train_config.get("embedding_type", "RANDOM") == "RANDOM" else embedding_path
+
+    # Create a directory for each heldout sample
+    for j in range(len(heldout_samples)):
+        
+        heldout = heldout_samples[j]
+        print(f"Running for heldout sample: {heldout}")
+        out_dir = os.path.join(output_dir, heldout)
+        if not os.path.exists(out_dir):
+            os.mkdir(out_dir)
+            
+
+        runs = 3
+
+        #abundance_table, train_data , test_data, embedding_path, distances = load_data(args
+        
+
         #for fold, (train_idx, val_idx) in enumerate(kf.split(train_samples)):
         for i in range(runs):
             print(f"Run {i+1}/{runs} for heldout sample {heldout}")
@@ -901,6 +908,8 @@ def main():
                 json.dump({**train_config, "seed": seed_values[i]}, f, indent=4)
             with open(os.path.join(result_dir, "ablation_config.json"), "w") as f:
                 json.dump(ABLATION, f, indent=4)
+            print("Ablation Config:", ABLATION)
+            print(result_dir)
 
             res = train_model(
                     model=model,
