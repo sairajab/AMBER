@@ -598,6 +598,9 @@ class BasicRegressorFilm(nn.Module):
             nn.Linear(768, 256), nn.ReLU(),
             nn.Linear(256, input_dim), nn.LayerNorm(input_dim),
         )
+        
+        #self.seq_embeddings = nn.Embedding(755658+1, 768)  # Learnable sequence embeddings for sequences
+        
         self.query_vector = nn.Parameter(torch.randn(1, 1, input_dim) / np.sqrt(input_dim))
 
         if self.pe:
@@ -612,15 +615,27 @@ class BasicRegressorFilm(nn.Module):
         # metadata_cardinalities = [n_categories_feat0, n_categories_feat1, ...]
         # None or [] => no metadata used at all.
         self.metadata_cardinalities = metadata_cardinalities or []
+        if len(self.metadata_cardinalities) > input_dim:
+            raise ValueError("metadata feature count cannot exceed input_dim")
+        metadata_dims = [
+            input_dim // len(self.metadata_cardinalities)
+            + (index < input_dim % len(self.metadata_cardinalities))
+            for index in range(len(self.metadata_cardinalities))
+        ] if self.metadata_cardinalities else []
         self.metadata_embeddings = nn.ModuleList([
             nn.Embedding(num_embeddings=card + 1,   # +1 for an optional pad/unknown index
-                         embedding_dim=input_dim//len(self.metadata_cardinalities))
-            for card in self.metadata_cardinalities
+                         embedding_dim=embedding_dim)
+            for card, embedding_dim in zip(self.metadata_cardinalities, metadata_dims)
         ])
         
         
         self.n_meta_tokens = len(self.metadata_cardinalities)
         if self.n_meta_tokens > 0:
+            # self.film = nn.Sequential(
+            #     nn.Linear(input_dim, 64),
+            #     nn.ReLU(),
+            #     nn.Linear(64, input_dim * 2)  # FiLM modulation parameters
+            # )
             self.film = nn.Linear(input_dim, input_dim * 2)  # FiLM modulation parameters
             
 
@@ -637,7 +652,7 @@ class BasicRegressorFilm(nn.Module):
             self.grl_layer = GradientReversalLayer()
             self.subject_head = nn.Sequential(
                 nn.Linear(input_dim, hidden_dim // 2), nn.ReLU(),
-                nn.Dropout(dropout), nn.Linear(hidden_dim // 2, unique_donors_train))
+                nn.Dropout(0.01), nn.Linear(hidden_dim // 2, unique_donors_train))
 
         self.output_head = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2), nn.GELU(),
@@ -668,10 +683,22 @@ class BasicRegressorFilm(nn.Module):
         nn.init.normal_(self.query_vector, mean=0.0, std=0.02)
         if self.pe:
             nn.init.normal_(self.pos_embedding.position_embeddings.weight, mean=0.0, std=0.02)
+        if self.grl:
+            nn.init.normal_(self.subject_head[0].weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.subject_head[0].bias)
+            nn.init.normal_(self.subject_head[3].weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.subject_head[3].bias)
         
         if hasattr(self, 'film'):
-            nn.init.zeros_(self.film.bias)
-            nn.init.zeros_(self.film.weight)
+            if isinstance(self.film, nn.Sequential):
+                for layer in self.film:
+                    if isinstance(layer, nn.Linear):
+                        nn.init.zeros_(layer.bias)
+                        nn.init.zeros_(layer.weight)
+            else:
+                nn.init.zeros_(self.film.bias)
+                nn.init.zeros_(self.film.weight)
+            
 
     def forward(self, input_embeddings, abundances, masks,
                 features=None, donor_ids=None):
@@ -680,7 +707,15 @@ class BasicRegressorFilm(nn.Module):
                   Column j must have values in [0, metadata_cardinalities[j]-1].
         """
         B = input_embeddings.shape[0]
+        #input_embeddings = self.seq_embeddings(input_embeddings.long())  # Convert to embeddings
         asv_embeddings = self.scale_embeddings(input_embeddings)
+        
+        # --- Training-time noise / mask dropout ---
+        if self.training:
+            abundances = abundances + torch.randn_like(abundances) * 0.01
+            drop = torch.rand_like(masks.float()) < 0.1
+            masks = masks.bool() & ~drop.bool()
+                    
 
         # --- Abundance fusion ---
         if self.clr:
@@ -690,11 +725,7 @@ class BasicRegressorFilm(nn.Module):
         else:
             weighted = asv_embeddings * abundances + asv_embeddings
 
-        # --- Training-time noise / mask dropout ---
-        if self.training:
-            abundances = abundances + torch.randn_like(abundances) * 0.01
-            drop = torch.rand_like(masks.float()) < 0.1
-            masks = masks.bool() & ~drop.bool()
+        
 
         # --- Prepend CLS query token ---
         cls_mask = torch.ones(B, 1, device=masks.device, dtype=masks.dtype)
@@ -709,6 +740,8 @@ class BasicRegressorFilm(nn.Module):
 
         # Count prediction from ASV positions (skip CLS at index 0)
         count_pred = self.count_out(asv_refined[:, 1:, :])
+        
+        #subject_summary = asv_refined[:, 0, :]  # CLS token summary ## for test
 
         # --- Dynamic metadata tokens ---
         if features is not None and self.n_meta_tokens > 0:
@@ -717,6 +750,7 @@ class BasicRegressorFilm(nn.Module):
                 f"got {features.shape[1]}")
             meta_tokens = []
             for j, emb in enumerate(self.metadata_embeddings):
+                
                 col = features[:, j].long()                   # [B]
                 meta_tokens.append(emb(col))     # [B, D]
                 
@@ -735,7 +769,6 @@ class BasicRegressorFilm(nn.Module):
             asv_refined, src_key_padding_mask=full_pad_mask)
 
         summary = self.norm(target_encoded[:,0,:])
-        #self.attn_pooling(target_encoded, masks)
 
         if self.grl:
             subj_pred = self.subject_head(self.grl_layer(summary))

@@ -45,39 +45,29 @@ from torch.optim.swa_utils import AveragedModel
 # ABLATION CONFIG 
 # ============================================================
 ABLATION = {
-    "name": "seqmit_env_bimonth_restored_model_film_b64",        # goes into output path + saved config
-    "use_env": True,                     # include env metadata token
-    "use_bimonth": True,                 # include bimonth metadata token
+    "name": "best_amber_new_grl",        # goes into output path + saved config
+    "metadata_columns": ["env", "bi_month_name"],  # metadata columns to use "env", "bi_month_name"
     "use_count_loss": True,              # auxiliary abundance head
-    "grl": False,
+    "grl": True,                          # use gradient reversal layer for adversarial training
     "clr": False,
 }
 
-# Derive metadata_cardinalities from the ablation flags.
-# Order MUST match how `features` columns are built below.
-META_SPEC = []
-if ABLATION["use_env"]:
-    META_SPEC.append(("env", 2))         # 2 categories: indoor/outdoor
-if ABLATION["use_bimonth"]:
-    META_SPEC.append(("bimonth", 6))     # 6 bi-monthly buckets
-
-metadata_cardinalities = [card for _, card in META_SPEC] or None
-# ============================================================
+METADATA_COLUMNS = list(ABLATION["metadata_columns"])
 
 def build_features(batch, meta_spec, device):
-    """Build [B, n_meta] integer feature tensor in the order given by meta_spec.
-    Returns None if meta_spec is empty (no-metadata ablation)."""
+    """Return the collated categorical features in the configured column order."""
     if not meta_spec:
         return None
-    cols = []
-    for name, _card in meta_spec:
-        if name == "env":
-            cols.append(batch['env'].to(device).long())
-        elif name == "bimonth":
-            cols.append(batch['season'].to(device).long())
-        else:
-            raise ValueError(f"Unknown metadata feature: {name}")
-    return torch.stack(cols, dim=1)  # [B, n_meta]
+    expected_names = [name for name, _cardinality in meta_spec]
+    actual_names = batch.get("meta_names", [])
+    if actual_names != expected_names:
+        raise ValueError(
+            f"Metadata columns mismatch: expected {expected_names}, got {actual_names}"
+        )
+    features = batch.get("features")
+    if features is None:
+        raise ValueError(f"Batch is missing configured metadata columns: {expected_names}")
+    return features.to(device=device, dtype=torch.long)
 
 
 def float_mask(tensor , dtype=torch.float32):
@@ -214,7 +204,7 @@ def train_model_GRL(model, num_epochs, learning_rate, device, out_dir, data_proc
 
     unique_donors = set(sampleID_map_donorID.values())
     print("Unique donors in dataset: ", len(unique_donors))
-    donor_to_idx = {donor: i for i, donor in enumerate(unique_donors)}
+    donor_to_idx = {donor: i for i, donor in enumerate(sorted(unique_donors))}
     print("Donor to Index Mapping: ", donor_to_idx)
     print(f"Adversarial Training Setup: Found {len(unique_donors)} unique donors.")
 
@@ -369,7 +359,7 @@ def train_model_GRL(model, num_epochs, learning_rate, device, out_dir, data_proc
 
     return {"best_loss": float(best_val_loss), "best_mae": float(best_mae)}
 
-def train_model(model, train_config, device, out_dir, data_processor, use_unifrac_loss=False, scale_abundance = True, multitask=False, grl=False): #abundance_table , distances, train_data, val_data, use_unifrac_loss=False, embedding_path=None,kmer_seqs=None, random_vector=False, kmer_embedding=False):
+def train_model(model, train_config, device, out_dir, data_processor, use_unifrac_loss=False, scale_abundance = True, multitask=False, grl=False, meta_spec=None): #abundance_table , distances, train_data, val_data, use_unifrac_loss=False, embedding_path=None,kmer_seqs=None, random_vector=False, kmer_embedding=False):
     count_loss_type = "mse"
     criterion = nn.MSELoss()
     #criterion = nn.SmoothL1Loss(beta=0.5)
@@ -395,11 +385,23 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
     patience = train_config.get("patience", 30)
     grl_loss_weight = train_config.get("grl_loss_weight", 0.1)
     use_count_loss = train_config.get("use_count_loss", True)
+    meta_spec = meta_spec or []
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.001)
     subsample_table = train_config.get("subsample", True)
 
     if hasattr(model, 'basemodel'):
         model.basemodel.requires_grad_(False)
+        
+    if hasattr(model, 'subject_head'):
+        head_params = list(model.subject_head.parameters())
+        head_ids = {id(p) for p in head_params}
+        base_params = [p for p in model.parameters() if id(p) not in head_ids]
+        optimizer = AdamW([
+            {"params": base_params, "lr": lr},
+            {"params": head_params, "lr": lr * 10, "weight_decay": 0.0},
+        ], weight_decay=0.001)
+
+
     
 
 
@@ -442,7 +444,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
     distances_target = None
     bins = False
     
-    donor_to_idx = {donor: i for i, donor in enumerate(unique_donors)}
+    donor_to_idx = {donor: i for i, donor in enumerate(sorted(unique_donors))}
 
 
 
@@ -455,6 +457,9 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
         per_batch_count_loss = 0
         per_batch_unifrac_loss = 0
         regression_loss = 0.0
+        adv_loss_sum = 0.0
+        adv_correct = 0
+        adv_total = 0
 
 
 
@@ -482,8 +487,28 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
             print("Bin occupancy:", dict(zip(unique, counts)))
         
         if grl:
-            p = min(1.0, epoch / 20.0)
-            alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
+            
+            warmup_epochs = 15  # off the LR restart at epoch 10 (CosineAnnealingWarmRestarts T_0=10, T_mult=2)
+
+            ramp = 30
+            alpha_max = 0.3
+            alpha = 0.0 if epoch < warmup_epochs else alpha_max * min(1.0, (epoch - warmup_epochs) / ramp)
+
+             #int(0.1 * epochs)
+
+            # if epoch < warmup_epochs:
+            #     alpha = 0.0
+            # else:
+            #     p = (epoch - warmup_epochs) / max(
+            #         1, epochs - warmup_epochs - 1
+            #     )
+            #     alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
+
+            # if model.grl:
+            #     model.grl_layer.alpha = alpha
+    
+            # p = min(1.0, epoch / 80.0)
+            # alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
             # Update the model's GRL alpha
             if hasattr(model, 'grl'):
                 print(f"Epoch {epoch+1}: Setting GRL alpha to {alpha:.4f}")
@@ -503,7 +528,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
 
             bimonth_idx = batch['season'].to(device)
 
-            features = build_features(batch, META_SPEC, device)
+            features = build_features(batch, meta_spec, device)
 
 
 
@@ -527,6 +552,12 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
                 loss_subj = criterion_subj(subj_pred, subj_targets)
                 #print(f"Batch Losses - Age: {loss.item():.4f}, Subj: {loss_subj.item():.4f}")
                 loss = loss + (grl_loss_weight * loss_subj) #earlier exps were with 0.1
+
+                adv_correct += (subj_pred.argmax(1) == subj_targets).sum().item()
+                adv_total += len(subj_targets)
+                adv_loss_sum += loss_subj.item()
+
+
 
             if use_count_loss and counts_pred is not None:
                 if bins:
@@ -552,7 +583,11 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
             labels.append(targets.cpu().detach().numpy())
 
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if hasattr(model, 'grl'):
+                torch.nn.utils.clip_grad_norm_(base_params, 1.0)
+                torch.nn.utils.clip_grad_norm_(head_params, 5.0)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
 
@@ -602,7 +637,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
                     all_ids.extend(batch["SampleID"])
                     sample_ids = batch["SampleID"]
                     bins_abundance = batch['binned_abundances'].to(device) if 'binned_abundances' in batch else None
-                    features = build_features(batch, META_SPEC, device)
+                    features = build_features(batch, meta_spec, device)
 
 
                     if bins:
@@ -651,6 +686,8 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
 
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"Train Loss: {train_loss:.4f}, Regression Loss: {regression_loss:.4f}, Count Loss: {per_batch_count_loss:.4f}, Unifrac Loss: {per_batch_unifrac_loss:.4f}, Train MAE: {train_mae:.4f}")
+        print(f"adv acc {adv_correct/adv_total:.3f} (chance {1/len(donor_to_idx):.3f}), "
+                f"adv CE {adv_loss_sum/len(train_loader):.3f} (log K = {np.log(len(donor_to_idx)):.3f})")
         print(f"Validation Loss: {val_loss:.4f}, Regression Loss: {regression_loss_val:.4f}, Count Loss: {per_batch_count_loss_val:.4f}, Unifrac Loss: {per_batch_unifrac_loss_val:.4f}, Validation MAE: {val_mae:.4f}")
         print(f"Val MAE: {val_mae:.4f} | smoothed({len(window)}): {smoothed_mae:.4f} "
         f"| best smoothed: {best_smoothed_mae:.4f}")
@@ -675,7 +712,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
             best_model_path = f'{out_dir}/model.pt'
             print(f"--> Saved (smoothed {best_smoothed_mae:.4f}, raw {val_mae:.4f})")
             print("Running predictions on validation set")
-            labels_p, predictions_p, per_sample_pred = predict(model, val_loader, device, scale_abundances=scale_abundance, val = True, multitask=multitask, meta_spec=META_SPEC)
+            labels_p, predictions_p, per_sample_pred = predict(model, val_loader, device, scale_abundances=scale_abundance, val = True, multitask=multitask, meta_spec=meta_spec)
             err = _mean_absolute_error(predictions_p, labels_p, f"{out_dir}/best_model_valid_2.png")
             err = _mean_absolute_error(predictions_p * 100, labels_p * 100, f"{out_dir}/best_model_valid.png")
             print(f"MAE on validation set: {err}")
@@ -788,30 +825,36 @@ def main():
 
     biom_file = os.path.join(data_dir, "process_data_all/exported-feature-table/feature-table.biom")
     biom_file_sheds = os.path.join(data_dir, "data/new_data/feature-table/feature-table.biom")
+    new_biom_file = os.path.join(data_dir, "data/new_pmi_modeling_files/merged_latest_table.biom")
 
     sheds_file = os.path.join(data_dir, "data/new_data/metadata_sheds.tsv")
-    metadata_file = os.path.join(data_dir, "data/new_data/combined_metadata_merged.tsv")
-    embedding_path = os.path.join(data_dir, "data/embeddings/all_data.h5") #all_data.h5"
+    metadata_file = os.path.join(data_dir, "data/new_data/merged_metadata_final.csv") # combined_metadata_merged.tsv
+    new_metadata_file = os.path.join(data_dir, "data/new_pmi_modeling_files/train_metadata_latest.csv")
+    
+    embedding_path = os.path.join(data_dir, "data/embeddings/all_data.h5") #all_data_new.h5"
     heldout_samples = pd.read_csv(sheds_file, sep="\t")['DonorID'].unique().tolist()
 
     
     datasets = { "SHEDS" : [biom_file_sheds, metadata_file, embedding_path],
-                "ALL_DATA" : [biom_file, metadata_file, embedding_path]
+                "ALL_DATA" : [biom_file, metadata_file, embedding_path],
+                "NEW_DATA" : [new_biom_file,new_metadata_file, embedding_path ]
     }
 
 
-
-    EXP_DATA = datasets["SHEDS"] # Change to switch dataset
+    key_data = "ALL_DATA"
+    EXP_DATA = datasets[key_data] # Change to switch dataset
     biom_file, metadata_file, embedding_path = EXP_DATA
     
     
-    experiment_name = f"sheds_{ABLATION['name']}"
+    experiment_name = f"{key_data.lower()}_{ABLATION['name']}"
     output_dir = os.path.join(data_dir, f"microbiome_model/results/final/{experiment_name}/") #clusteredbaseline2
 
-    computed = ["D5", "D7", "D9", "D13", "D14", "D15", "D20", "D22", "D24", "D26", "D27", "D28", "D30"]
+    #computed = ["D4","D6", "D8", "D10", "D11", "D12", "D14", "D16", "D17","D18", "D19", "D21", "D7","D29", "D13", "D15", "D20", "D29", "D30"]
+    #computed = ["D4","D6", "D8", "D10", "D11", "D12", "D13", "D14", "D15", "D16", "D17","D18", "D19", "D20", "D21", "D27", "D29"]# For testing purposes, limit to a few donors
+    computed = []
     heldout_samples = [s for s in heldout_samples if s not in computed]
-    
-    heldout_samples = ["D23", "D24", "D25", "D26", "D27", "D28", "D29", "D30"] # For testing purposes, limit to a few donors
+    heldout_samples = ["D15", "D20", "D9", "D27"]# For testing purposes, limit to a few donors
+    #heldout_samples = ["D5", "D7","D9"] # For testing purposes, limit to a few donors
     print(f"Heldout samples for this experiment: {heldout_samples}")
     
     #pd.read_csv(metadata_file)[""]
@@ -833,13 +876,15 @@ def main():
             "data": "all_data",
             "grl": ABLATION["grl"],
             "clr": ABLATION["clr"],
-            "metadata_cardinalities": metadata_cardinalities,   # <-- drives the model
+            "metadata_columns": METADATA_COLUMNS,
+            "metadata_categories": {},
+            "metadata_cardinalities": None,
             "pretrained_weights": os.path.join(data_dir, "microbiome_model/results/MaskedPretrainSkin/pretrained_best.pt"),
             "num_donors": 74
         }
     train_config = {
                 "batch_size": 64,
-                "learning_rate": 1e-04,
+                "learning_rate": 5e-05,
                 "reg_count_loss": 1.0,  # Weight for count reconstruction loss
                 "early_stop_warmup": 15,
                 "patience": 15,
@@ -848,7 +893,7 @@ def main():
                 "scale_abundance": True,
                 "seeds": seed_values,
                 "grl": grl, 
-                "grl_loss_weight": 0.1,
+                "grl_loss_weight": 0.5,  # Weight for GRL loss
                 "subsample": True,  
                 "embedding_path": embedding_path,
                 'embedding_type': "DNABERT",  # or "DNABERT" or "RANDOM"
@@ -861,7 +906,10 @@ def main():
         
         heldout = heldout_samples[j]
         print(f"Running for heldout sample: {heldout}")
-        out_dir = os.path.join(output_dir, heldout)
+        if heldout is None:
+            out_dir = os.path.join(output_dir, "no_heldout")
+        else:
+            out_dir = os.path.join(output_dir, heldout)
         if not os.path.exists(out_dir):
             os.mkdir(out_dir)
             
@@ -874,6 +922,8 @@ def main():
         #for fold, (train_idx, val_idx) in enumerate(kf.split(train_samples)):
         for i in range(runs):
             print(f"Run {i+1}/{runs} for heldout sample {heldout}")
+            setup_seed(seed_values[i])  # Different seed for each run
+
 
             cleanup_resources()
             args = Arguments(
@@ -887,7 +937,24 @@ def main():
             clr=clr
                 )
             data_processor = DataProcessor(args)
-            data_processor.load_data(multitask=multitask, column="bi_month_name")
+            # data_processor.load_biom()
+            # data_processor.load_sequences()
+            # if data_processor.seq_to_idx is None:
+            #     print("Sequence to index mapping not found. Ensure that sequences are loaded correctly.")
+            # else:
+            #     print(f"Loaded {len(data_processor.seq_to_idx)} unique sequences.")
+
+            data_processor.load_data(
+                multitask=multitask,
+                column="bi_month_name",
+                metadata_columns=METADATA_COLUMNS,
+            )
+            meta_spec = [
+                (column, len(data_processor.metadata_categories[column]))
+                for column in METADATA_COLUMNS
+            ]
+            model_config["metadata_categories"] = data_processor.metadata_categories
+            model_config["metadata_cardinalities"] = [cardinality for _, cardinality in meta_spec] or None
 
             ### number of donors in training and validation sets
             train_donors = set([data_processor.sampleID_map_donorID[sid] for sid in data_processor.train_data[0]])
@@ -896,7 +963,6 @@ def main():
             print(f"Number of unique donors in validation set: {len(val_donors)}")
             model_config["num_donors"] = len(train_donors)  # Pass this to the model config for GRL or donor-aware components
             print("Model Config:", model_config)
-            setup_seed(seed_values[i])  # Different seed for each run
             model = build_model(model_config, str(device))
 
             result_dir = os.path.join(out_dir, f"run_{i+1}")
@@ -919,7 +985,8 @@ def main():
                     data_processor=data_processor,
                     use_unifrac_loss=False,
                     scale_abundance = train_config["scale_abundance"],
-                    grl=grl
+                    grl=grl,
+                    meta_spec=meta_spec,
                 )
             print(res)            
             res["seed"] = seed_values[i]
