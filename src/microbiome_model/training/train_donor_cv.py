@@ -29,8 +29,8 @@ SEED = 42
 METADATA_COLUMNS = ["env", "bi_month_name"]
 
 ARCHITECTURES = {
-    "best_model_grl": {"model_name": "BasicRegressorFilm", "num_layers": 4, 
-                         "input_dim": 128, "hidden_dim": 512, "num_heads": 8, "dropout": 0.3, "pe": False, "grl": True, "clr": False},
+    "best_model_": {"model_name": "BasicRegressorFilm", "num_layers": 4, 
+                         "input_dim": 128, "hidden_dim": 512, "num_heads": 8, "dropout": 0.3, "pe": False, "grl": False, "clr": False},
     # "film_4layer_nope_grl_no_norm": {"model_name": "BasicRegressorFilm", "num_layers": 4, 
     #                      "input_dim": 128, "hidden_dim": 512, "num_heads": 8, "dropout": 0.3, "pe": False, "grl": True, "clr": False},
     #"film_2layer_nope_nogrl_no_norm": {"model_name": "BasicRegressorFilm", "num_layers": 2, 

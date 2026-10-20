@@ -45,10 +45,10 @@ from torch.optim.swa_utils import AveragedModel
 # ABLATION CONFIG 
 # ============================================================
 ABLATION = {
-    "name": "best_amber_new_grl",        # goes into output path + saved config
+    "name": "test_new_t_pred",        # goes into output path + saved config
     "metadata_columns": ["env", "bi_month_name"],  # metadata columns to use "env", "bi_month_name"
     "use_count_loss": True,              # auxiliary abundance head
-    "grl": True,                          # use gradient reversal layer for adversarial training
+    "grl": False,                          # use gradient reversal layer for adversarial training
     "clr": False,
 }
 
@@ -359,6 +359,23 @@ def train_model_GRL(model, num_epochs, learning_rate, device, out_dir, data_proc
 
     return {"best_loss": float(best_val_loss), "best_mae": float(best_mae)}
 
+def next_abundance_sse(pred, batch, masks, device, scale_abundance):
+    """Squared error of next-timepoint abundance predictions.
+
+    Only real (unpadded) ASVs of samples that have a next timepoint count.
+    Returns (sum of squared errors, number of positions) so epoch means are exact.
+    """
+    target = batch['next_abundances'].to(device)
+    target = target / 1e4 if scale_abundance else target          # match the input scale
+    # print("target", target[0])
+    # print("pred", pred[0])
+    valid = masks.bool() & batch['has_next'].to(device)[:, None]  # (B, L)
+    if pred is None or not valid.any():
+        return torch.zeros((), device=device), 0
+    sq = (pred.squeeze(-1) - target.squeeze(-1)) ** 2
+    return sq[valid].sum(), int(valid.sum())
+
+
 def train_model(model, train_config, device, out_dir, data_processor, use_unifrac_loss=False, scale_abundance = True, multitask=False, grl=False, meta_spec=None): #abundance_table , distances, train_data, val_data, use_unifrac_loss=False, embedding_path=None,kmer_seqs=None, random_vector=False, kmer_embedding=False):
     count_loss_type = "mse"
     criterion = nn.MSELoss()
@@ -371,6 +388,9 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
     val_losses = []
     val_count_losses = []
     val_regression_losses = []
+    train_next_losses = []
+    val_next_losses = []
+    val_next_baseline_losses = []
     train_maes = []
     val_maes = []
     lrs = []
@@ -385,6 +405,8 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
     patience = train_config.get("patience", 30)
     grl_loss_weight = train_config.get("grl_loss_weight", 0.1)
     use_count_loss = train_config.get("use_count_loss", True)
+    next_loss_weight = train_config.get("next_loss_weight", 1.0)
+    next_loss_weight = 10
     meta_spec = meta_spec or []
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.001)
     subsample_table = train_config.get("subsample", True)
@@ -457,6 +479,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
         per_batch_count_loss = 0
         per_batch_unifrac_loss = 0
         regression_loss = 0.0
+        next_sse, next_n = 0.0, 0
         adv_loss_sum = 0.0
         adv_correct = 0
         adv_total = 0
@@ -537,13 +560,19 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
                 continue
 
             optimizer.zero_grad()
-            if grl:
-                outputs, counts_pred, unifrac_embeddings,_,  subj_pred = model(embeddings, abundances, masks, features)
-            else:
-                outputs, counts_pred, unifrac_embeddings, diversity_pred, _ = model(embeddings, abundances, masks, features)
+            model_out = model(embeddings, abundances, masks, features)
+            outputs, counts_pred, unifrac_embeddings, diversity_pred, subj_pred = model_out[:5]
+            d_next = model_out[5] if len(model_out) > 5 else None
+            next_count_pred = abundances + d_next
 
             loss = criterion(outputs, targets)
             regression_loss += loss.item()
+
+            sse, n = next_abundance_sse(next_count_pred, batch, masks, device, scale_abundance)
+            if n > 0:
+                loss = loss + next_loss_weight * (sse / n)
+                next_sse += sse.item()
+                next_n += n
 
 
             if grl:
@@ -556,6 +585,8 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
                 adv_correct += (subj_pred.argmax(1) == subj_targets).sum().item()
                 adv_total += len(subj_targets)
                 adv_loss_sum += loss_subj.item()
+            print(counts_pred[0,:10,:])
+            print(abundances[0,:10])
 
 
 
@@ -583,7 +614,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
             labels.append(targets.cpu().detach().numpy())
 
             total_loss.backward()
-            if hasattr(model, 'grl'):
+            if grl:
                 torch.nn.utils.clip_grad_norm_(base_params, 1.0)
                 torch.nn.utils.clip_grad_norm_(head_params, 5.0)
             else:
@@ -609,6 +640,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
         per_batch_count_loss /= len(train_loader)
         per_batch_unifrac_loss /= len(train_loader)
         regression_loss /= len(train_loader)
+        next_loss = next_sse / max(next_n, 1)
 
 
         predictions = []
@@ -623,6 +655,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
         print("..................Running validation.....................")
         print(val_dataset.biom_data.shape)
         regression_loss_val = 0.0
+        next_sse_val, next_n_val, next_sse_base = 0.0, 0, 0.0
         for i in range(1):
             #val_dataset.sample_epoch_init(epoch=epoch+i)
             #val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=False, collate_fn=sparse_collate_fn)
@@ -639,11 +672,24 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
                     bins_abundance = batch['binned_abundances'].to(device) if 'binned_abundances' in batch else None
                     features = build_features(batch, meta_spec, device)
 
-
                     if bins:
                         abundances = bins_abundance
                         
-                    outputs, counts_pred, unifrac_embeddings, diversity_pred, _ = model(embeddings, abundances, masks, features)
+                    model_out = model(embeddings, abundances, masks, features)
+                    outputs, counts_pred, unifrac_embeddings, diversity_pred, _ = model_out[:5]
+                    d_next = model_out[5] if len(model_out) > 5 else None
+                    next_count_pred = abundances + d_next if d_next is not None else None
+
+                    # Next-timepoint loss, and the "no change" baseline (predict next = current)
+                    sse, n = next_abundance_sse(next_count_pred, batch, masks, device, scale_abundance)
+                    if n > 0:
+                        current = batch['abundances'].to(device)
+                        current = current / 1e4 if scale_abundance else current
+                        sse_base, _ = next_abundance_sse(current, batch, masks, device, scale_abundance)
+                        next_sse_val += sse.item()
+                        next_sse_base += sse_base.item()
+                        next_n_val += n
+
                     if use_count_loss and counts_pred is not None:
                         if bins:
                             count_loss = distance_weighted_ce(abundances, counts_pred, num_bins=50, mask=masks)
@@ -663,6 +709,8 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
 
 
                     total_loss = loss + (reg_count_loss * count_loss)
+                    if n > 0:
+                        total_loss = total_loss + next_loss_weight * (sse / n)
 
                     val_loss += total_loss.item()
                     per_batch_count_loss_val += count_loss.item()
@@ -675,6 +723,8 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
         #val_loss /= len(val_loader)
         per_batch_count_loss_val /= (len(val_loader) * 1)
         per_batch_unifrac_loss_val /= (len(val_loader) * 1)
+        next_loss_val = next_sse_val / max(next_n_val, 1)
+        next_loss_base = next_sse_base / max(next_n_val, 1)
         labels = np.concatenate(labels)
         predictions = np.concatenate(predictions)
         val_mae = mean_absolute_error(labels, predictions)
@@ -686,9 +736,12 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
 
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"Train Loss: {train_loss:.4f}, Regression Loss: {regression_loss:.4f}, Count Loss: {per_batch_count_loss:.4f}, Unifrac Loss: {per_batch_unifrac_loss:.4f}, Train MAE: {train_mae:.4f}")
-        print(f"adv acc {adv_correct/adv_total:.3f} (chance {1/len(donor_to_idx):.3f}), "
+        if grl:
+            print(f"adv acc {adv_correct/adv_total:.3f} (chance {1/len(donor_to_idx):.3f}), "
                 f"adv CE {adv_loss_sum/len(train_loader):.3f} (log K = {np.log(len(donor_to_idx)):.3f})")
         print(f"Validation Loss: {val_loss:.4f}, Regression Loss: {regression_loss_val:.4f}, Count Loss: {per_batch_count_loss_val:.4f}, Unifrac Loss: {per_batch_unifrac_loss_val:.4f}, Validation MAE: {val_mae:.4f}")
+        print(f"Next-abundance MSE: train {next_loss:.3e} | val {next_loss_val:.3e} "
+              f"| val no-change baseline {next_loss_base:.3e} ({next_n_val} ASV positions)")
         print(f"Val MAE: {val_mae:.4f} | smoothed({len(window)}): {smoothed_mae:.4f} "
         f"| best smoothed: {best_smoothed_mae:.4f}")
         if hasattr(model, '_count_alpha'):
@@ -700,6 +753,9 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
         train_regression_losses.append(regression_loss)
         val_count_losses.append(per_batch_count_loss_val)
         val_regression_losses.append(regression_loss_val)
+        train_next_losses.append(next_loss)
+        val_next_losses.append(next_loss_val)
+        val_next_baseline_losses.append(next_loss_base)
 
         print("difference between smoothed mae and best smoothed mae: ", smoothed_mae - best_smoothed_mae)
         if warm and smoothed_mae < best_smoothed_mae - 0.003:
@@ -754,7 +810,9 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
     
 
     pd.DataFrame({'lrs': lrs}).to_csv(f'{out_dir}/lrs.csv', index=False)
-    pd.DataFrame({'train_loss': train_losses, 'val_loss': val_losses}).to_csv(f'{out_dir}/losses.csv', index=False)
+    pd.DataFrame({'train_loss': train_losses, 'val_loss': val_losses,
+                  'train_next_loss': train_next_losses, 'val_next_loss': val_next_losses,
+                  'val_next_baseline_loss': val_next_baseline_losses}).to_csv(f'{out_dir}/losses.csv', index=False)
 
     return {"best_loss": float(best_val_loss), "best_mae": float(best_mae), "best_model": best_model_path}
 
@@ -885,7 +943,7 @@ def main():
     train_config = {
                 "batch_size": 64,
                 "learning_rate": 5e-05,
-                "reg_count_loss": 1.0,  # Weight for count reconstruction loss
+                "reg_count_loss": 10.0,  # Weight for count reconstruction loss
                 "early_stop_warmup": 15,
                 "patience": 15,
                 "num_epochs": 200,

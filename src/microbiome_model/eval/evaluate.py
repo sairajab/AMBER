@@ -40,11 +40,23 @@ def build_features(batch, meta_spec, device):
     MUST match the training-time builder exactly."""
     if not meta_spec:
         return None
+    expected_names = [name for name, _cardinality in meta_spec]
+    features = batch.get("features")
+    if features is not None:
+        actual_names = batch.get("meta_names", [])
+        if actual_names != expected_names:
+            raise ValueError(
+                f"Metadata columns mismatch: expected {expected_names}, got {actual_names}"
+            )
+        return features.to(device=device, dtype=torch.long)
+ 
     cols = []
     for name, _card in meta_spec:
         if name == "env":
             cols.append(batch['env'].to(device).long())
-        elif name == "bimonth":
+        elif name in {"bimonth", "bi_month_name"}:
+            cols.append(batch['season'].to(device).long())
+        elif name == "insect_activity":
             cols.append(batch['season'].to(device).long())
         else:
             raise ValueError(f"Unknown metadata feature: {name}")
@@ -54,12 +66,15 @@ def predict(model, loader, device, scale_abundances=False, val=False,
             multitask=False, meta_spec=None):
     """Generate predictions for a dataset"""
 
-    #     #### D20 unique features
-    # with open("../D12_unique_features.txt", "r") as f:
-    #     d20_unique_features = [line.strip() for line in f]
-    #     d20_unique_features = set(d20_unique_features)
+        #### D20 unique features
+    with open("/s/chromatin/o/nobackup/Saira/Microbiome_Project/D9_unique_features.txt", "r") as f:
+        d20_unique_features = [line.strip() for line in f]
+        d20_unique_features = set(d20_unique_features)
         
     model = model.to(device)
+    print(f"Predicting with model on device {device}...")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"****************Total parameters: {total_params:,}")
     model.eval()
     predictions = []
     labels = []
@@ -102,8 +117,6 @@ def predict(model, loader, device, scale_abundances=False, val=False,
 
             # if d20_unique_features is not None:
             #     for i in range(embeddings.shape[0]):
-            #         if sample_ids[i] == "13810.SKF.SHED.D12.2020.T12":
-            #             print(abundances[i])
             #         seqs = seqids[i]
             #         for k, s in enumerate(seqs):
             #             if s in d20_unique_features:
@@ -139,13 +152,13 @@ def predict(model, loader, device, scale_abundances=False, val=False,
             
             if val:
                 for i in range(targets.shape[0]):
-                    # seqs = seqids[i]  # list of ASV IDs for this sample
+                    seqs = seqids[i]  # list of ASV IDs for this sample
                     uniq_feats = 0
-                    # for s in seqs:
-                    #     if s in d20_unique_features:
-                    #         uniq_feats += 1
+                    for s in seqs:
+                        if s in d20_unique_features:
+                            uniq_feats += 1
 
-                    per_sample_preds[sample_ids[i]] = [float(outputs[i].cpu()), float(targets[i].cpu()), uniq_feats]
+                    per_sample_preds[sample_ids[i]] = [float(outputs[i].cpu()), float(targets[i].cpu()), uniq_feats, masks[i].sum().item()]
                 
             # loss = criterion(outputs, targets)
             # test_loss += loss.item()        
@@ -282,7 +295,7 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path, eva
 
     multitask = False
     mean_mae = 0
-
+    
 
     
 
@@ -308,69 +321,80 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path, eva
 
         print(f"Best run for donor {donor_id}: {best_run_dir} (val MAE {best_mae})")
 
-        # ---- Evaluate best run multiple times ----
-        total_mae = []
-        for k in range(eval_runs):
-            train_config_path = os.path.join(best_run_dir, "training_config.json")
-            if os.path.exists(train_config_path):
-                with open(train_config_path) as f:
-                    train_config = json.load(f)
-            
+        train_config_path = os.path.join(best_run_dir, "training_config.json")
+        #if os.path.exists(train_config_path):
+        with open(train_config_path) as f:
+                train_config = json.load(f)
                 if "embedding_path" in train_config:
                     print(f"Using embedding path from train_config.json: {train_config['embedding_path']}")
                     embedding_path = train_config["embedding_path"]
-            print("embedding path: ", embedding_path)
-            args = Arguments(
-                biom_file=biom_file,
-                metadata_file=metadata_file,
-                tree_path=None,
-            embedding_file=embedding_path,
-            embedding="DNABERT",
-                heldout=donor_id,
-                sort_asvs=True,
-                clr=False,
-            )
-            data_processor = DataProcessor(args)
-            data_processor.load_data(multitask=True, column="bi_month_name")
+                if train_config["embedding_type"] == "RANDOM":
+                    print("Using RANDOM embedding for evaluation.")
+                    embedding_path = None
+        args = Arguments(
+                        biom_file=biom_file,
+                        metadata_file=metadata_file,
+                        tree_path=None,
+                        embedding_file=embedding_path,
+                        embedding=train_config["embedding_type"],
+                        heldout=donor_id,
+                        sort_asvs=True,
+                        clr=False,
+                        )
+        data_processor = DataProcessor(args)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        cfg_path = os.path.join(best_run_dir, "model_config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path) as f:
+                model_cfg = json.load(f)
+                if "model_name" not in model_cfg:
+                    print("overriding model_name to BasicRegressor for evaluation")
+                    model_cfg["model_name"] = "BasicRegressor"
+        else:
+            logging.warning(
+                            "model_config.json not found in %s; falling back to default BasicRegressor config.",
+                            best_run_dir,
+                        )
+            model_cfg = {"model_name": "BasicRegressor", "input_dim": 128, "pe": False}
+            print(f"Using model config: {model_cfg}")
+
+        data_processor.load_data(
+            multitask=True,
+            column="bi_month_name",
+            metadata_columns=model_cfg.get("metadata_columns"),
+            metadata_categories=model_cfg.get("metadata_categories"),
+        )
+        model_a = build_model(model_cfg, str(device))
+        checkpoint = torch.load(os.path.join(best_run_dir, "model.pt"), map_location=device)
+        model_a.load_state_dict(checkpoint, strict=True)
+        model_a.to(device)
+        print(f"Loaded model {model_cfg['model_name']} from {best_run_dir}")
+        print(model_a)
+        print("Checkpoint keys and tensor sizes:")
+        for key, tensor in checkpoint.items():
+                        print(f"{key}: {tensor.size()}")
+        if "metadata_columns" in model_cfg:
+            cards = model_cfg.get("metadata_cardinalities") or []
+            meta_spec = list(zip(model_cfg["metadata_columns"], cards))
+        else:
+            cards = model_cfg.get("metadata_cardinalities", [2, 6])
+            card_to_name = {2: "env", 6: "bimonth"}
+            meta_spec = [(card_to_name[card], card) for card in cards] if cards else []
+        
+        print(f"meta_spec: {meta_spec}")
+        
+        #meta_spec = [("insect_activity",2), ("env",2)]
+                    
+        # ---- Evaluate best run multiple times ----
+        total_mae = []
+        #per_sample_preds[sample_ids[i]] = [float(outputs[i].cpu()), float(targets[i].cpu()), uniq_feats]
+        accumulated_preds = defaultdict(lambda: {"preds": [], "targets": [], "uniq_feats": None})
+        for k in range(eval_runs):
             
             test_dataset = data_processor.sample_test_data(epoch=k)
             test_loader = torch.utils.data.DataLoader(
                 test_dataset, batch_size=32, shuffle=False, num_workers=4, collate_fn=sparse_collate_fn
             )
-
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            cfg_path = os.path.join(best_run_dir, "model_config.json")
-            if os.path.exists(cfg_path):
-                with open(cfg_path) as f:
-                    model_cfg = json.load(f)
-                    #if "model_name" not in model_cfg:
-                    print("overriding model_name to BasicRegressor for evaluation")
-                    model_cfg["model_name"] = "BasicRegressor1"
-            else:
-                logging.warning(
-                    "model_config.json not found in %s; falling back to default BasicRegressor config.",
-                    best_run_dir,
-                )
-                model_cfg = {"model_name": "BasicRegressor", "input_dim": 128, "pe": False}
-            print(f"Using model config: {model_cfg}")
-            model_a = build_model(model_cfg, str(device))
-            checkpoint = torch.load(os.path.join(best_run_dir, "model.pt"), map_location=device)
-            model_a.load_state_dict(checkpoint, strict=True)
-            model_a.to(device)
-            print(f"Loaded model {model_cfg['model_name']} from {best_run_dir}")
-            print(model_a)
-            print("Checkpoint keys and tensor sizes:")
-            for key, tensor in checkpoint.items():
-                print(f"{key}: {tensor.size()}")
-            cards = model_cfg.get("metadata_cardinalities", [2,6])
-            CARD_TO_NAME = {2: "env", 6: "bimonth"}
-            if cards:
-                meta_spec = [(CARD_TO_NAME[c], c) for c in cards]
-            else:
-                meta_spec = []
-
-            print(f"meta_spec: {meta_spec}")
-
 
             labels, predictions, per_sample_pred = predict(
                 model_a, test_loader, device, scale_abundances=True, val = True, multitask=multitask, meta_spec=meta_spec
@@ -383,10 +407,18 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path, eva
 
 
 
-            with open(f"{best_run_dir}/test_predictions.json", "w") as fs:
+            with open(f"{best_run_dir}/test_predictions_run_{k}_without.json", "w") as fs:
                 json.dump(per_sample_pred,  fs, indent=4)
             # Get sample IDs in the same order as predictions
             sample_ids = list(per_sample_pred.keys()) if isinstance(per_sample_pred, dict) else test_dataset.sample_ids
+
+            # Accumulate predictions and targets for each sample ID
+            for sample_id in sample_ids:
+                pred, target, uniq_feats, total_feats = per_sample_pred[sample_id]
+                accumulated_preds[sample_id]["preds"].append(pred)
+                accumulated_preds[sample_id]["targets"].append(target)
+                accumulated_preds[sample_id]["uniq_feats"] = uniq_feats
+                accumulated_preds[sample_id]["total_feats"] = total_feats
 
             mae_t = _mean_absolute_error(predictions * 100, labels * 100, f'{best_run_dir}/test.png')
             total_mae.append(float(mae_t))
@@ -394,7 +426,6 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path, eva
 
             donor_labels.extend(labels * 100)
             donor_preds.extend(predictions * 100)
-            print("Sample IDs: ", sample_ids)
             donor_sample_ids.extend(sample_ids)
 
         avg_mae = np.mean(total_mae)
@@ -404,6 +435,19 @@ def evaluate_basic(donor_ids, res, metadata_file, biom_file, embedding_path, eva
         mean_mae += avg_mae
 
         print(f"Donor {donor_id} | Average MAE over {eval_runs} runs: {avg_mae:.4f} ± {std_mae:.4f}")
+        averaged_per_sample_preds = {
+            sample_id: [
+                float(np.mean(data["preds"])),     # Mean predicted value
+                float(data["targets"][0]),          # Ground truth target
+                data["uniq_feats"],                 # Preserved unique features
+                data["total_feats"]                 # Total features
+            ]
+            for sample_id, data in accumulated_preds.items()
+        }
+
+        # Save final averaged predictions
+        with open(f"{best_run_dir}/test_predictions_averaged_without.json", "w") as fs:
+            json.dump(averaged_per_sample_preds, fs, indent=4)
 
 
         all_labels.extend(donor_labels)
@@ -436,12 +480,10 @@ def _plot_face_hip_colored(predictions, labels, sample_ids, save_path):
     
     predictions = np.array(predictions).flatten()
     labels = np.array(labels).flatten()
-    print(sample_ids)
     # Identify face vs hip from sample IDs
     is_face = np.array(['SKF' in str(sid) for sid in sample_ids])
     is_hip = np.array(['SKH' in str(sid) for sid in sample_ids])
-    print(is_face.dtype, is_face)
-    print(is_hip.dtype, is_hip)
+
     is_other = ~(is_face | is_hip)
     
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -635,13 +677,17 @@ if __name__ == "__main__":
 
         data_dir = "/s/chromatin/o/nobackup/Saira/Microbiome_Project/"
         output_dir = os.path.join(data_dir, "microbiome_model/results/ModelSelection/tmp")
-        output_dir = os.path.join(data_dir, "microbiome_model/results//all_data_seqmit_env_bimonth_curr_model") #clusteredbaseline2
+        output_dir = os.path.join(data_dir, "microbiome_model/results/final/all_data_test_new_t_pred/") #clusteredbaseline2
         biom_file = os.path.join(data_dir, "process_data_all/exported-feature-table/feature-table.biom")
         biom_file_sheds = os.path.join(data_dir, "data/new_data/feature-table/feature-table.biom")
         sheds_file = os.path.join(data_dir, "data/new_data/metadata_sheds.tsv")
-        metadata_file = os.path.join(data_dir, "data/new_data/combined_metadata_merged.tsv")
+        metadata_file = os.path.join(data_dir, "data/new_data/merged_metadata_final.csv")
         embedding_path = os.path.join(data_dir, "data/embeddings/all_data.h5") #all_data_s_dnabert
         donor_ids = pd.read_csv(sheds_file, sep="\t")['DonorID'].unique().tolist()
-        donor_ids = ["D24"] #,"D22", "D27", "D24", "D29", "D12", "D6", "D8", "D10", "D19", "D21", "D23", "D25", "D11"]
-        evaluate_basic(donor_ids, output_dir, metadata_file, biom_file, embedding_path, eval_runs=10, runs=3)
+        donor_ids =  ["D20"] #, "D13", "D27","D20"] #, "D15", "D20"] #, "D15", "D29"]#, "D30", "D4", "D26", "D28", "D13", "D15", "D20", "D27", "D24", "D29", "D12", "D6", "D8", "D10", "D19", "D21", "D23", "D25", "D11"]
+        new_metadata_file = os.path.join(data_dir, "data/new_pmi_modeling_files/train_metadata_latest.csv")
+        new_biom_file = os.path.join(data_dir, "data/new_pmi_modeling_files/merged_latest_table.biom")
+
+        evaluate_basic(donor_ids, output_dir, metadata_file,biom_file, embedding_path, eval_runs=10, runs=3)
+        #evaluate_basic(donor_ids, output_dir, new_metadata_file,new_biom_file, embedding_path, eval_runs=1, runs=3)
         #evaluate_all_runs(donor_ids, output_dir, metadata_file, biom_file, embedding_path)

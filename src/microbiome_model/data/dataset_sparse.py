@@ -4,9 +4,30 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import time
 import os
+import re
 np.set_printoptions(threshold=np.inf)
 from microbiome_model.data.embedding_loader import *
 from collections import defaultdict
+
+# Timepoint suffix in sample IDs: "...T14", "...T14.1" (13810), "...day8", "...16day2" (14989/15700)
+TIMEPOINT_RE = re.compile(r'(?:\.T|day)(\d+)(?:\.\d+)?$')
+
+
+def parse_timepoint(sample_id):
+    m = TIMEPOINT_RE.search(str(sample_id))
+    return int(m.group(1)) if m else None
+
+
+def build_series_keys(metadata_df, donor_col="host_subject_id", site_col="body_site"):
+    """sample_id -> (donor, body_site); samples sharing a key form one time series."""
+    return dict(zip(metadata_df["sample_name"].astype(str),
+                    zip(metadata_df[donor_col], metadata_df[site_col])))
+
+
+def build_sample_times(metadata_df, time_col="days_since_placement"):
+    """sample_id -> elapsed days. Preferred over parse_timepoint: ID labels count
+    visits (14989 'day2' can be 2 days after placement when a day was skipped)."""
+    return dict(zip(metadata_df["sample_name"].astype(str), metadata_df[time_col].astype(float)))
 
 class DonorAwareSampler(torch.utils.data.Sampler):
     def __init__(self, sample_ids, sampleID_map_donorID, batch_size=64, pairs_per_batch=8):
@@ -82,7 +103,7 @@ class DonorAwareSampler(torch.utils.data.Sampler):
     
     
 class MicrobiomeSparseDataset(Dataset):
-    def __init__(self, biom_table, sample_targets, sort_asvs=True, embedding_loader=None, kmer_seqs=None, one_hot_seqs=None, test_split = False,random_vec=False, seed = None, env = None, sample_metadata = None, n_bins = 50, subsample= True, clr = False, categorical_metadata = None):
+    def __init__(self, biom_table, sample_targets, sort_asvs=True, embedding_loader=None, learnable_embeddings=False, seq_to_idx = None, kmer_seqs=None, one_hot_seqs=None, test_split = False,random_vec=False, seed = None, env = None, sample_metadata = None, n_bins = 50, subsample= True, clr = False, categorical_metadata = None, asv_stats = None, series_keys = None, sample_times = None, max_time_gap = None):
         """
         Dataset class for sample-level microbiome data using disk-based embeddings.
 
@@ -96,8 +117,16 @@ class MicrobiomeSparseDataset(Dataset):
                 index 0 is reserved for unknown/missing, matching
                 BasicRegressor's metadata embedding convention. Samples not
                 present in a mapping default to 0.
+            series_keys (dict): Optional sample_id -> series key (e.g. (donor, body_site),
+                see build_series_keys). When given, each item also returns the abundances
+                of the next timepoint in the same series ('next_abundances').
+            sample_times (dict): Optional sample_id -> time (see build_sample_times).
+                If None, the time is parsed from the sample ID suffix (T3 / day3).
+            max_time_gap (int): If set, only link to a next timepoint at most this far
+                ahead (1 = strictly t+1). None = next available timepoint.
         """
         self.biom_table =  biom_table.copy()
+        
         self.sample_targets = sample_targets
         self.env = env
         if subsample:
@@ -121,12 +150,20 @@ class MicrobiomeSparseDataset(Dataset):
         self.one_hot_seqs = one_hot_seqs
         # Open embedding file in read mode
         self.embedding_loader = embedding_loader
+        self.learnable_embeddings = learnable_embeddings
+        self.seq_to_idx = seq_to_idx
         self.sample_seasons = sample_metadata
         self.categorical_metadata = categorical_metadata or {}
         self.env_bool = None
         self.n_bins = n_bins
         self.clr = clr
-        self.max_len = 1024
+        self.max_len = 512
+        self.asv_stats = asv_stats
+        self.series_keys = series_keys
+        self.sample_times = sample_times
+        self.max_time_gap = max_time_gap
+        self.next_idx, self.next_dt = self._build_next_index()
+        
         if isinstance(self.env, tuple):
             if len(self.env) != 2:
                 raise ValueError("Expected tuple with exactly 2 elements (indoor_samples, outdoor_samples)")
@@ -156,6 +193,41 @@ class MicrobiomeSparseDataset(Dataset):
         self.sample_ids = self.biom_data.ids()
         self.sample_targets =  {k: v for k, v in self.sample_targets.items() if k in self.sample_ids}
         self.table_data = self._table_data(self.biom_data)
+        self.next_idx, self.next_dt = self._build_next_index()
+
+    def _build_next_index(self):
+        """Map each sample index to the index of the next timepoint in its series.
+
+        Only samples present in this dataset are linked, so the next sample never
+        crosses a train/test split. Replicates at the same timepoint all point to
+        the first replicate of the next timepoint.
+        """
+        if self.series_keys is None:
+            return {}, {}
+        series = defaultdict(lambda: defaultdict(list))
+        for i, sid in enumerate(self.sample_ids):
+            key = self.series_keys.get(sid)
+            t = self.sample_times.get(sid) if self.sample_times is not None else parse_timepoint(sid)
+            if key is None or t is None:
+                continue
+            series[key][t].append(i)
+
+        next_idx, next_dt = {}, {}
+        for by_t in series.values():
+            times = sorted(by_t)
+            for t, t_next in zip(times, times[1:]):
+                if self.max_time_gap is not None and t_next - t > self.max_time_gap:
+                    continue
+                for i in by_t[t]:
+                    next_idx[i] = by_t[t_next][0]
+                    next_dt[i] = t_next - t
+        print(f"Next-timepoint links: {len(next_idx)}/{len(self.sample_ids)} samples")
+        return next_idx, next_dt
+
+    def _raw_sample(self, idx):
+        """Raw counts and ASV ids for one sample index."""
+        s_mask = self.table_data[1] == idx
+        return self.table_data[0][s_mask], self.obs_ids[self.table_data[2][s_mask]]
         
     def _table_data(self, table):
         table = table.copy()
@@ -200,6 +272,22 @@ class MicrobiomeSparseDataset(Dataset):
         #print(s_mask)
         abundances = self.table_data[0][s_mask]
         
+        # coverages = []
+
+        # for i in range(len(self.sample_ids)):
+        #     s_mask = self.table_data[1] == i
+        #             #print(s_mask)
+        #     values = self.table_data[0][s_mask]
+        #     #values = np.asarray(sample)
+        #     top256 = np.sort(values)[::-1][:512]
+        #     coverage = top256.sum() / (values.sum() + 1e-6)
+        #     coverages.append(coverage)
+
+        # print("Mean coverage:", np.mean(coverages))
+        # print("Median coverage:", np.median(coverages))
+        # print("Minimum coverage:", np.min(coverages))
+        # print("Samples below 95%:", np.mean(np.array(coverages) < 0.95))
+            
         s_obs = self.table_data[2][s_mask]
         s_obs_ids = self.obs_ids[s_obs]
 
@@ -211,17 +299,29 @@ class MicrobiomeSparseDataset(Dataset):
         #     abundances = abundances[top_k]
 
 
+
+            
         if self.clr:
             
             abundances = self.clr_transform(torch.tensor(abundances, dtype=torch.float32)).numpy()
         else:
             abundances = abundances / (abundances.sum() + 1e-6) #account for varying sequencing depth by converting to relative abundances
-            abundances = abundances * 1e4  # Scale abundances for better numerical stability
 
-        
+        if self.asv_stats is not None:
+            means = np.array([self.asv_stats[asv_id][0] for asv_id in s_obs_ids])
+
+            stds = np.array([self.asv_stats[asv_id][1] for asv_id in s_obs_ids])
+
+            normalized_abundances = torch.tensor((abundances - means) / stds, dtype=torch.float32)
+            # print("normalized abundances", normalized_abundances)
+            # print("abundances", abundances)
+        abundances = abundances * 1e4  # Scale abundances for better numerical stability
+
+            
         if len(abundances) > 0:
             abundances = torch.tensor(abundances, dtype=torch.float32)
             ranks = torch.argsort(torch.argsort(abundances)).float()  # Get ranks of abundances
+            
             binned_abundances = (ranks / len(abundances) * self.n_bins).long() + 1
         else:
             binned_abundances = torch.empty(0, dtype=torch.long)
@@ -232,6 +332,8 @@ class MicrobiomeSparseDataset(Dataset):
 
         if self.sort_asvs:
             sorted_order = torch.argsort(abundances, descending=True)
+            #sorted_order = np.argsort(-normalized_abundances) # sort by normalized abundances in descending order
+
         else:
             sorted_order = torch.arange(len(abundances), dtype=torch.long)
 
@@ -250,6 +352,11 @@ class MicrobiomeSparseDataset(Dataset):
                     sample_embeddings = torch.stack([
                         self.one_hot_seqs[seq_id] for seq_id in s_obs_ids
                     ])
+            elif self.embedding_loader is None and self.learnable_embeddings and self.seq_to_idx is not None:
+                # Use learnable embeddings for sequences
+                sample_embeddings = torch.tensor([
+                                        self.seq_to_idx[seq_id] for seq_id in s_obs_ids
+                                    ], dtype=torch.long)
             else:
                 # Load the embeddings in batch for better I/O efficiency
                 start = time.time()
@@ -267,11 +374,26 @@ class MicrobiomeSparseDataset(Dataset):
 
         if self.sort_asvs and len(abundances) > self.max_len:
             sorted_order = sorted_order[:self.max_len]
+            
+            
         # Apply sorting
         abundances = abundances[sorted_order.numpy()].reshape(-1, 1)  # NumPy array indexing
+        
         sample_embeddings = sample_embeddings[sorted_order]  # PyTorch tensor indexing
         seqs_ids = [s_obs_ids[i] for i in sorted_order.numpy()]  # Get sorted sequence IDs
         binned_abundances = binned_abundances[sorted_order.numpy()]  # Sort binned abundances as well
+
+        # Abundances at the next timepoint, aligned to this sample's (sorted) ASVs.
+        # Relative abundance * 1e4 like 'abundances' (no CLR); ASVs absent at t+1 are 0.
+        next_abundances = torch.zeros(len(seqs_ids), 1, dtype=torch.float32)
+        n_idx = self.next_idx.get(idx)
+        if n_idx is not None:
+            n_counts, n_obs_ids = self._raw_sample(n_idx)
+            n_rel = n_counts / (n_counts.sum() + 1e-6) * 1e4
+            lookup = dict(zip(n_obs_ids, n_rel))
+            next_abundances = torch.tensor(
+                [lookup.get(s, 0.0) for s in seqs_ids], dtype=torch.float32
+            ).reshape(-1, 1)
 
         return {
             'SampleID': sample_id,
@@ -282,6 +404,10 @@ class MicrobiomeSparseDataset(Dataset):
             'seqs_ids': seqs_ids,
             'env': self.env_bool[sample_id] if self.env_bool is not None else -1,
             'season': self.sample_seasons[sample_id] if self.sample_seasons is not None else -1,
+            'next_abundances': next_abundances,
+            'has_next': n_idx is not None,
+            'next_dt': self.next_dt.get(idx, 0),
+            'next_SampleID': self.sample_ids[n_idx] if n_idx is not None else None,
             'categorical_metadata': {
                 name: mapping.get(sample_id, 0)
                 for name, mapping in self.categorical_metadata.items()
@@ -319,20 +445,30 @@ def collate_fn(batch):
     # Find the max length of embeddings in the batch for padding
     max_len = max(e.shape[0] for e in embeddings)
     # Pad embeddings and abundances to ensure equal shape in batch
+    
     if len(embeddings[0].shape) == 2:
         padded_embeddings = torch.zeros(len(batch), max_len, embeddings[0].shape[1])  # (Batch, Max_Len, Emb_Dim)
+    elif len(embeddings[0].shape) == 1:
+        padded_embeddings = torch.zeros(len(batch), max_len)  # (Batch, Max_Len)
     else:
         padded_embeddings = torch.zeros(len(batch), max_len, embeddings[0].shape[1], embeddings[0].shape[2])  # (Batch, Max_Len, Emb_Dim)
     padded_abundances = torch.zeros(len(batch), max_len, 1)  # (Batch, Max_Len, 1)
     padded_seqs_ids = [None] * len(batch)  # Placeholder for seqs_ids
     batch_masks = torch.zeros(len(batch), max_len)
     padded_binned_abundances = torch.zeros(len(batch), max_len, dtype=torch.long)
+    padded_next_abundances = torch.zeros(len(batch), max_len, 1)
 
     for i, (emb, abun) in enumerate(zip(embeddings, abundances)):
         length = emb.shape[0]
-        padded_embeddings[i, :length, :] = emb  # Copy actual data
+        if padded_embeddings.ndim == 3:
+            padded_embeddings[i, :length, :] = emb  # Copy actual data
+        elif padded_embeddings.ndim == 2:
+            padded_embeddings[i, :length] = emb  # Copy actual data
+            
         padded_abundances[i, :length, :] = abun  # Copy actual abundances
         padded_binned_abundances[i, :length] = binned_abundances[i]  # Copy actual binned abundances
+        if 'next_abundances' in batch[i]:
+            padded_next_abundances[i, :length, :] = batch[i]['next_abundances']
         batch_masks[i, :length] = 1
     for i, seqs in enumerate(seqs_ids):
         padded_seqs_ids[i] = seqs + [None] * (max_len - len(seqs))
@@ -362,6 +498,10 @@ def collate_fn(batch):
         'binned_abundances': padded_binned_abundances,  # (Batch, Max_Len)
         'features': features,  # (Batch, n_meta) or None
         'meta_names': meta_names,
+        'next_abundances': padded_next_abundances,  # (Batch, Max_Len, 1), aligned to 'abundances'
+        'has_next': torch.tensor([item.get('has_next', False) for item in batch]),  # (Batch,)
+        'next_dt': torch.tensor([item.get('next_dt', 0) for item in batch], dtype=torch.float32),
+        'next_SampleID': [item.get('next_SampleID') for item in batch],
     }
 
 

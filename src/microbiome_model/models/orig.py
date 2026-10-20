@@ -639,6 +639,10 @@ class BasicRegressorFilm(nn.Module):
             self.film = nn.Linear(input_dim, input_dim * 2)  # FiLM modulation parameters
             
 
+        ####
+        self.abundance_proj = nn.Linear(1, input_dim)
+        
+        
         self.sample_encoder = nn.TransformerEncoderLayer(
             d_model=input_dim, nhead=num_heads, dim_feedforward=hidden_dim,
             dropout=dropout, activation=gelu, batch_first=True)
@@ -646,6 +650,7 @@ class BasicRegressorFilm(nn.Module):
 
         self.norm = nn.LayerNorm(input_dim)
         self.count_out = nn.Linear(input_dim, 1, bias=False)
+        self.next_count_out = nn.Linear(input_dim, 1, bias=False)
         self.dropout = nn.Dropout(dropout)
 
         if self.grl:
@@ -712,7 +717,8 @@ class BasicRegressorFilm(nn.Module):
         
         # --- Training-time noise / mask dropout ---
         if self.training:
-            abundances = abundances + torch.randn_like(abundances) * 0.01
+            abundances = abundances * (1 + 0.05 * torch.randn_like(abundances))   # relative noise, not absolute
+
             drop = torch.rand_like(masks.float()) < 0.1
             masks = masks.bool() & ~drop.bool()
                     
@@ -723,7 +729,10 @@ class BasicRegressorFilm(nn.Module):
         elif self.pe:
             weighted = asv_embeddings + self.pos_embedding(asv_embeddings) * abundances
         else:
-            weighted = asv_embeddings * abundances + asv_embeddings
+            #weighted = asv_embeddings * abundances + asv_embeddings
+            weighted = asv_embeddings + self.abundance_proj(torch.log(abundances.clamp_min(0) + 1e-6))
+
+            
 
         
 
@@ -740,6 +749,7 @@ class BasicRegressorFilm(nn.Module):
 
         # Count prediction from ASV positions (skip CLS at index 0)
         count_pred = self.count_out(asv_refined[:, 1:, :])
+        next_count_pred = self.next_count_out(asv_refined[:,1:,:])
         
         #subject_summary = asv_refined[:, 0, :]  # CLS token summary ## for test
 
@@ -769,12 +779,13 @@ class BasicRegressorFilm(nn.Module):
             asv_refined, src_key_padding_mask=full_pad_mask)
 
         summary = self.norm(target_encoded[:,0,:])
+        
 
         if self.grl:
             subj_pred = self.subject_head(self.grl_layer(summary))
-            return self.output_head(summary), count_pred, None, None, subj_pred
+            return self.output_head(summary), count_pred, None, None, subj_pred, next_count_pred
 
-        return self.output_head(summary), count_pred, None, None, None
+        return self.output_head(summary), count_pred, None, None, None, next_count_pred
     
 
 class BasicRegressorFilm2(nn.Module):
