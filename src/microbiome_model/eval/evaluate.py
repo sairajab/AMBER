@@ -40,11 +40,23 @@ def build_features(batch, meta_spec, device):
     MUST match the training-time builder exactly."""
     if not meta_spec:
         return None
+    expected_names = [name for name, _cardinality in meta_spec]
+    features = batch.get("features")
+    if features is not None:
+        actual_names = batch.get("meta_names", [])
+        if actual_names != expected_names:
+            raise ValueError(
+                f"Metadata columns mismatch: expected {expected_names}, got {actual_names}"
+            )
+        return features.to(device=device, dtype=torch.long)
+ 
     cols = []
     for name, _card in meta_spec:
         if name == "env":
             cols.append(batch['env'].to(device).long())
-        elif name == "bimonth":
+        elif name in {"bimonth", "bi_month_name"}:
+            cols.append(batch['season'].to(device).long())
+        elif name == "insect_activity":
             cols.append(batch['season'].to(device).long())
         else:
             raise ValueError(f"Unknown metadata feature: {name}")

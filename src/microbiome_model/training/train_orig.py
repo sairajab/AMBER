@@ -45,10 +45,10 @@ from torch.optim.swa_utils import AveragedModel
 # ABLATION CONFIG 
 # ============================================================
 ABLATION = {
-    "name": "best_amber_new_grl",        # goes into output path + saved config
+    "name": "testtttttt",        # goes into output path + saved config
     "metadata_columns": ["env", "bi_month_name"],  # metadata columns to use "env", "bi_month_name"
     "use_count_loss": True,              # auxiliary abundance head
-    "grl": True,                          # use gradient reversal layer for adversarial training
+    "grl": False,                          # use gradient reversal layer for adversarial training
     "clr": False,
 }
 
@@ -583,7 +583,7 @@ def train_model(model, train_config, device, out_dir, data_processor, use_unifra
             labels.append(targets.cpu().detach().numpy())
 
             total_loss.backward()
-            if hasattr(model, 'grl'):
+            if grl:
                 torch.nn.utils.clip_grad_norm_(base_params, 1.0)
                 torch.nn.utils.clip_grad_norm_(head_params, 5.0)
             else:
@@ -853,7 +853,7 @@ def main():
     #computed = ["D4","D6", "D8", "D10", "D11", "D12", "D13", "D14", "D15", "D16", "D17","D18", "D19", "D20", "D21", "D27", "D29"]# For testing purposes, limit to a few donors
     computed = []
     heldout_samples = [s for s in heldout_samples if s not in computed]
-    heldout_samples = ["D15", "D20", "D9", "D27"]# For testing purposes, limit to a few donors
+    heldout_samples = ["D15", "D20"]#, "D9", "D27"]# For testing purposes, limit to a few donors
     #heldout_samples = ["D5", "D7","D9"] # For testing purposes, limit to a few donors
     print(f"Heldout samples for this experiment: {heldout_samples}")
     

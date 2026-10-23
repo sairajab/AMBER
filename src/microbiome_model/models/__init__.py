@@ -2,7 +2,7 @@ import os
 import torch
 
 from microbiome_model.models.orig import (
-    BasicRegressor,
+    BasicRegressorFilm,
     AMBERRegressor,
     BasicRegressorwithUnifrac,
 )
@@ -41,8 +41,8 @@ def build_model(cfg: dict, device: str = "cpu"):
     """
     name = cfg["model_name"]
 
-    if name == "BasicRegressor":
-        return BasicRegressor(
+    if name == "BasicRegressorFilm":
+        return BasicRegressorFilm(
             input_dim=cfg.get("input_dim", 768),
             hidden_dim=cfg.get("hidden_dim", 1024),
             num_heads=cfg.get("num_heads", 4),
