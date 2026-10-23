@@ -1,3 +1,5 @@
+import pickle
+
 import torch
 import os
 import random
@@ -14,7 +16,7 @@ from torch.utils.data import Sampler
 from sklearn.model_selection import GroupKFold, train_test_split
 
 
-from microbiome_model.data.dataset_sparse import MicrobiomeSparseDataset
+from microbiome_model.data.dataset_sparse import MicrobiomeSparseDataset, build_series_keys, build_sample_times
 from microbiome_model.data.embedding_loader import compute_and_save_embeddings, compute_and_save_token_embeddings, compute_and_save_embeddings_fast, EmbeddingLoader as RandomEmbeddingLoader
 from microbiome_model.data.optimized_embedding_loader import MemoryMappedEmbeddingLoader as EmbeddingLoader 
 
@@ -236,7 +238,7 @@ def finetuned_dna_bert(embedding_path, sequences, device):
                 output_path=embedding_path,
                 batch_size=1024,  # Adjust batch size as needed
                 device=device,
-                pooling = "mean"
+                pooling = "cls"  # or "mean" depending on your preference
             )
             # compute_and_save_token_embeddings(
             #     sequences=sequences,
@@ -311,13 +313,35 @@ class DataProcessor:
         self.indoor_samples = None
         self.outdoor_samples = None
         self.sample_seasons = None
+        self.sample_categorical_metadata = {}
+        self.metadata_categories = {}
+        self.metadata_columns = []
         self.pmival_test_data = None
         self.sampleID_map_donorID = {}
+        self.seq_to_idx = {}
+        self.series_keys = None   # sample_id -> (donor, body_site), for next-timepoint targets
+        self.sample_times = None  # sample_id -> days_since_placement
 
     def load_biom(self):
         table = load_table(self.config.biom_file)
         self.table = table
-        return table
+        # prevalence = np.asarray((table.matrix_data > 0).mean(axis=1)).flatten()
+        # print(f"Original BIOM table: {self.table.shape[0]} ASVs, {self.table.shape[1]} samples")
+        # # Keep ASVs present in at least 1% of samples
+        # keep_asvs = prevalence >= 0.01
+
+        # # Filter the BIOM table
+        # asv_ids = table.ids(axis="observation")
+        # kept_ids = asv_ids[keep_asvs]
+
+        # self.table = table.filter(
+        #     kept_ids,
+        #     axis="observation",
+        #     inplace=False
+        # )
+        # print(f"Filtered BIOM table: {self.table.shape[0]} ASVs, {self.table.shape[1]} samples")
+
+        return self.table
 
     def load_sequences(self):
         """
@@ -329,6 +353,7 @@ class DataProcessor:
 
         s_ids = self.table.ids(axis="observation")
         self.sequences = {s_id: s_id for s_id in s_ids}
+        self.seq_to_idx = {s_id: idx+1 for idx, s_id in enumerate(s_ids)}
         return self.sequences
 
     def compute_unifrac(self):
@@ -370,7 +395,7 @@ class DataProcessor:
             raise ValueError("BIOM table not loaded yet. Call load_biom() first.")
 
         ids = self.table.ids()
-        metadata_df = pd.read_csv(self.config.metadata_file, delimiter="\t")
+        metadata_df = pd.read_csv(self.config.metadata_file, sep=None, engine="python")
         metadata_df["sample_name"] = metadata_df["sample_name"].astype(str)
         self.sampleID_map_donorID = dict(zip(metadata_df["sample_name"], metadata_df["host_subject_id"]))
 
@@ -403,9 +428,16 @@ class DataProcessor:
                 "Sep-Oct": 4,
                 "Nov-Dec": 5,
             }
+        elif column == "insect_previous_maggot_activity_use":
+            _map = {
+                "y": 1,
+                "n": 2,
+            }
         else:
             raise ValueError(f"Unknown metadata column: {column}")
 
+        print("Metadata column value counts:")
+        print(filtered[column].value_counts())
         # Handle missing/unexpected values safely
         if filtered[column].isnull().any():
             missing = filtered[filtered[column].isnull()]["sample_name"].tolist()[:10]
@@ -419,11 +451,43 @@ class DataProcessor:
         self.sample_seasons = dict(zip(filtered["sample_name"], meta_array))
         return self.sample_seasons
 
+    def load_categorical_metadata(self, columns, categories=None):
+        """Encode arbitrary metadata columns as stable per-sample category IDs."""
+        self.metadata_columns = list(columns or [])
+        self.sample_categorical_metadata = {}
+        self.metadata_categories = {}
+        if not self.metadata_columns:
+            return
+
+        metadata_df = pd.read_csv(self.config.metadata_file, sep=None, engine="python")
+        metadata_df["sample_name"] = metadata_df["sample_name"].astype(str)
+        filtered = metadata_df[metadata_df["sample_name"].isin(self.table.ids())].copy()
+
+        for column in self.metadata_columns:
+            if column not in filtered.columns:
+                raise ValueError(f"Metadata column '{column}' not found in {self.config.metadata_file}")
+
+            values = filtered[column].map(
+                lambda value: None if pd.isna(value) else str(value).strip()
+            )
+            if categories is not None and column in categories:
+                column_categories = [str(value) for value in categories[column]]
+            else:
+                column_categories = sorted(values.dropna().unique().tolist())
+
+            category_to_index = {
+                value: index for index, value in enumerate(column_categories, start=1)
+            }
+            encoded = values.map(category_to_index).fillna(0).astype(int)
+            self.metadata_categories[column] = column_categories
+            self.sample_categorical_metadata[column] = dict(
+                zip(filtered["sample_name"], encoded)
+            )
 
     def load_targets_multitask(self):
 
         ids = self.table.ids()
-        targets_df = pd.read_csv(self.config.metadata_file, delimiter="\t")
+        targets_df = pd.read_csv(self.config.metadata_file, sep=None, engine="python")
         ## for some reasons sheds table has 13810 at the beginning of the sample ids
         ## concat all sample ids with 13810 for sheds data only
         #targets_df["SampleID"] = "13810." + targets_df["SampleID"].astype(str)
@@ -513,9 +577,16 @@ class DataProcessor:
         self.match_samples()
         self.seqs_processed = self.process_sequences()
     
-    def load_data(self, multitask=False, column="season"):
+    def load_data(
+        self,
+        multitask=False,
+        column="season",
+        metadata_columns=None,
+        metadata_categories=None,
+    ):
 
         self.run(multitask=multitask, column=column)
+        self.load_categorical_metadata(metadata_columns, categories=metadata_categories)
         sample_ids = list(self.sample_targets.keys())
 
         train_samples, test_samples = one_body_out(sample_ids, donor_id = self.config.heldout)
@@ -697,9 +768,18 @@ class DataProcessor:
             )
     
     
+    def load_time_series(self):
+        """Cache series keys and timepoints so datasets can link each sample to its next timepoint."""
+        if self.series_keys is not None:
+            return
+        metadata_df = pd.read_csv(self.config.metadata_file, sep=None, engine="python")
+        self.series_keys = build_series_keys(metadata_df)
+        self.sample_times = build_sample_times(metadata_df)
+
     def sample_data(self, epoch, subsample = True, get_fold=-1, random_vector=False):
     # Create datasets
 
+        self.load_time_series()
         train_samples, train_targets = self.train_data
 
         if get_fold >= 0 and hasattr(self, 'cv_splits'):
@@ -735,32 +815,79 @@ class DataProcessor:
         
         train_table = self.table.filter(train_samples , inplace = False)
         val_table = self.table.filter(val_samples , inplace = False)
+        
+                # Rows = samples, columns = ASVs
+        train_abundances = train_table.matrix_data.toarray().T
+
+        # Convert counts to relative abundances per sample
+        train_abundances = train_abundances / (
+            train_abundances.sum(axis=1, keepdims=True) + 1e-6
+        )
+
+        # Mean and std for each ASV across training samples
+        asv_mean = train_abundances.mean(axis=0)
+        asv_std = train_abundances.std(axis=0)
+
+        # Avoid division by zero
+        asv_std[asv_std == 0] = 1.0
+
+        # Map ASV ID to its statistics
+        asv_ids = np.array(train_table.ids(axis="observation"))
+        asv_std = np.maximum(asv_std, 0.001)
+        
+        asv_stats = {
+            asv_id: (mean, std)
+            for asv_id, mean, std in zip(asv_ids, asv_mean, asv_std)
+        }
+        # save to file 
+        with open("asv_stats.pkl", "wb") as f:
+            pickle.dump(asv_stats, f)
+            
+
         print("Kmer embeddings:", self.config.kmer_embeddings, "Embedding file:", self.config.embedding_file)
         if not self.config.kmer_embeddings and self.config.embedding_file is None:
+                print("Using random embeddings for training and validation data.")
                 embedding_loader = RandomEmbeddingLoader(self.config.embedding_file, embedding_dim=768)
                 train_dataset = MicrobiomeSparseDataset(
                     biom_table=train_table,
+                    series_keys=self.series_keys, sample_times=self.sample_times,
                     one_hot_seqs=self.seqs_processed,
                     sample_targets=train_targets, 
                     sort_asvs=self.config.sort_asvs,
-                    embedding_loader=embedding_loader,
-                    random_vec=True, 
-                    seed = epoch 
-                )
+                    learnable_embeddings=True,
+                    seq_to_idx = self.seq_to_idx,
+                    embedding_loader=None, # emebedding_loader,
+                    random_vec=False, # True
+                    seed = epoch,
+                    env = (self.indoor_samples, self.outdoor_samples) ,
+                    sample_metadata=self.sample_seasons,
+                    categorical_metadata=self.sample_categorical_metadata,
+                    clr = self.config.clr,
+                    subsample=subsample
+                                  )
                 val_dataset = MicrobiomeSparseDataset(
                     biom_table=val_table,
+                    series_keys=self.series_keys, sample_times=self.sample_times,
                     one_hot_seqs=self.seqs_processed,
                     sample_targets=val_targets, 
                     sort_asvs=self.config.sort_asvs,
-                    embedding_loader=embedding_loader,
-                    random_vec=True,
-                    seed = 9999
+                    learnable_embeddings=True,
+                    embedding_loader=None, # emebedding_loader,
+                    seq_to_idx = self.seq_to_idx,
+                    random_vec=False, # True
+                    seed = epoch ,
+                    env = (self.indoor_samples, self.outdoor_samples),
+                    sample_metadata=self.sample_seasons,
+                    categorical_metadata=self.sample_categorical_metadata,
+                    clr = self.config.clr,
+                    subsample=subsample
                 )
         elif not self.config.kmer_embeddings and self.config.embedding_file is not None:
             # Use the embedding path to create the dataset
             embedding_loader = EmbeddingLoader(self.config.embedding_file)
             train_dataset = MicrobiomeSparseDataset(
                     biom_table=train_table,
+                    series_keys=self.series_keys, sample_times=self.sample_times,
                     sample_targets=train_targets,
                    sort_asvs=self.config.sort_asvs,
                     embedding_loader=embedding_loader,
@@ -768,12 +895,15 @@ class DataProcessor:
                     seed = epoch,
                     env = (self.indoor_samples, self.outdoor_samples) ,
                     sample_metadata=self.sample_seasons,
+                    categorical_metadata=self.sample_categorical_metadata,
                     clr = self.config.clr,
-                    subsample=subsample
+                    subsample=subsample,
+                    asv_stats=asv_stats
                 )
                 
             val_dataset = MicrobiomeSparseDataset(
                         biom_table=val_table,
+                        series_keys=self.series_keys, sample_times=self.sample_times,
                         sample_targets=val_targets,
                         sort_asvs=self.config.sort_asvs,
                         embedding_loader=embedding_loader,
@@ -781,36 +911,48 @@ class DataProcessor:
                         seed = epoch ,
                         env = (self.indoor_samples, self.outdoor_samples),
                         sample_metadata=self.sample_seasons,
+                        categorical_metadata=self.sample_categorical_metadata,
                         clr = self.config.clr,
-                        subsample=subsample
+                        subsample=subsample,
+                        asv_stats=asv_stats
                     )
         elif self.config.kmer_embeddings and self.config.embedding_file is None:
             # Use the kmer_seqs to create the dataset
             train_dataset = MicrobiomeSparseDataset(
                     biom_table=train_table,
+                    series_keys=self.series_keys, sample_times=self.sample_times,
                     kmer_seqs=self.seqs_processed,
                     sort_asvs=self.config.sort_asvs,
-                    sample_targets=train_targets, random_vec=False
+                    sample_targets=train_targets, random_vec=False,
+                    categorical_metadata=self.sample_categorical_metadata
                 )
             val_dataset = MicrobiomeSparseDataset(
                         biom_table=val_table,
+                        series_keys=self.series_keys, sample_times=self.sample_times,
                         sort_asvs=self.config.sort_asvs,
                         kmer_seqs=self.seqs_processed,
                         sample_targets=val_targets, random_vec=False,
-                        seed=epoch
+                        seed=epoch,
+                        categorical_metadata=self.sample_categorical_metadata
                     )
         else:
             train_dataset = MicrobiomeSparseDataset(
                     biom_table=train_table,
+                    series_keys=self.series_keys, sample_times=self.sample_times,
+                    sort_asvs=self.config.sort_asvs,
+                    learned_embeddings=True,
                     kmer_seqs=self.seqs_processed,
                     sample_targets=train_targets, random_vec=True,
-                    seed = epoch
+                    seed = epoch,
+                    categorical_metadata=self.sample_categorical_metadata
                 )
             val_dataset = MicrobiomeSparseDataset(
                         biom_table=val_table,
+                        series_keys=self.series_keys, sample_times=self.sample_times,
                         sort_asvs=self.config.sort_asvs,
                         sample_targets=val_targets, random_vec=True,
-                        seed=epoch
+                        seed=epoch,
+                        categorical_metadata=self.sample_categorical_metadata
                     )
         
 
@@ -824,8 +966,14 @@ class DataProcessor:
 
     def sample_test_data(self, epoch = 0, subsample = True,random_vector=False):
 
+        self.load_time_series()
         test_samples, test_targets = self.test_data
         test_table = self.table.filter(test_samples, inplace=False)
+        
+        # load pkl file for asv mean and std
+        with open("asv_stats.pkl", "rb") as f:
+            asv_stats = pickle.load(f)
+            
 
 
         if not self.config.kmer_embeddings and self.config.embedding_file is None:
@@ -833,19 +981,27 @@ class DataProcessor:
                 embedding_loader = RandomEmbeddingLoader(self.config.embedding_file, embedding_dim=768)
                 test_dataset = MicrobiomeSparseDataset(
                     biom_table=test_table,
+                    series_keys=self.series_keys, sample_times=self.sample_times,
                     one_hot_seqs=self.seqs_processed,
                     sort_asvs=self.config.sort_asvs,
-                    embedding_loader=embedding_loader,
+                    embedding_loader=None, # emebedding_loader,
+                    learnable_embeddings=True,
+                    seq_to_idx = self.seq_to_idx,
                     sample_targets=test_targets, 
-                    random_vec=True, 
-                    seed = epoch,
+                    random_vec=False,  #True
+                    seed = epoch ,
+                    env = (self.indoor_samples, self.outdoor_samples),
+                    sample_metadata=self.sample_seasons,
+                    categorical_metadata=self.sample_categorical_metadata,
+                    clr = self.config.clr,
                     subsample=subsample
-                )
+                    )
         elif not self.config.kmer_embeddings and self.config.embedding_file is not None:
             # Use the embedding path to create the dataset
             embedding_loader = EmbeddingLoader(self.config.embedding_file)
             test_dataset = MicrobiomeSparseDataset(
                     biom_table=test_table,
+                    series_keys=self.series_keys, sample_times=self.sample_times,
                     sample_targets=test_targets,
                     sort_asvs=self.config.sort_asvs,
                     embedding_loader=embedding_loader,
@@ -853,16 +1009,20 @@ class DataProcessor:
                     seed = epoch,
                     env = (self.indoor_samples, self.outdoor_samples),
                     sample_metadata=self.sample_seasons,
+                    categorical_metadata=self.sample_categorical_metadata,
                     subsample=subsample,
-                    clr = self.config.clr
+                    clr = self.config.clr,
+                    asv_stats=asv_stats
                 )
         elif self.config.kmer_embeddings and self.config.embedding_file is None:
             # Use the kmer_seqs to create the dataset
             test_dataset = MicrobiomeSparseDataset(
                     biom_table=test_table,
+                    series_keys=self.series_keys, sample_times=self.sample_times,
                     kmer_seqs=self.seqs_processed,
                     sort_asvs=self.config.sort_asvs,
                     sample_targets=test_targets, random_vec=random_vector,
+                    categorical_metadata=self.sample_categorical_metadata,
                     subsample=subsample
                 )
         else:
@@ -919,12 +1079,14 @@ class DataProcessor:
     
     
     def sample_pmival_test_data(self, random_vector=False):
+        self.load_time_series()
         test_samples, test_targets = self.pmival_test_data
         test_table = self.table.filter(test_samples, inplace=False)
 
         if not self.config.kmer_embeddings and self.config.embedding_file is None:
             test_dataset = MicrobiomeSparseDataset(
                 biom_table=test_table,
+                series_keys=self.series_keys, sample_times=self.sample_times,
                 one_hot_seqs=self.seqs_processed,
                 sample_targets=test_targets,
                 random_vec=random_vector,
@@ -935,6 +1097,7 @@ class DataProcessor:
             embedding_loader = EmbeddingLoader(self.config.embedding_file)
             test_dataset = MicrobiomeSparseDataset(
                 biom_table=test_table,
+                series_keys=self.series_keys, sample_times=self.sample_times,
                 sample_targets=test_targets,
                 sort_asvs=self.config.sort_asvs,
                 embedding_loader=embedding_loader,
@@ -948,6 +1111,7 @@ class DataProcessor:
         elif self.config.kmer_embeddings and self.config.embedding_file is None:
             test_dataset = MicrobiomeSparseDataset(
                 biom_table=test_table,
+                series_keys=self.series_keys, sample_times=self.sample_times,
                 kmer_seqs=self.seqs_processed,
                 sample_targets=test_targets,
                 random_vec=random_vector
@@ -989,5 +1153,3 @@ def shuffle_indices(samples_dict):
 
 
      
-
-
